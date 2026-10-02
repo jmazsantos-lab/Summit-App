@@ -1,11 +1,11 @@
 // Summit · service worker: la app abre sin conexión. Los datos van siempre a Supabase.
-const VERSION = 'summit-1.0.1';
+const VERSION = 'summit-1.1.1';
 const SHELL = [
-  './', 'index.html', 'styles.css?v=1.0.1', 'app.js?v=1.0.1', 'config.js?v=1.0.1', 'lib/supabase.min.js', 'manifest.webmanifest',
-  'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png', 'icons/favicon-32.png', 'icons/logo.svg',
-  'fonts/figtree-latin-400-normal.woff2', 'fonts/figtree-latin-500-normal.woff2', 'fonts/figtree-latin-600-normal.woff2', 'fonts/figtree-latin-700-normal.woff2',
-  'fonts/bricolage-grotesque-latin-600-normal.woff2', 'fonts/bricolage-grotesque-latin-700-normal.woff2',
-  'fonts/ibm-plex-mono-latin-400-normal.woff2', 'fonts/ibm-plex-mono-latin-500-normal.woff2'
+  './', 'index.html', 'styles.css?v=1.1.1', 'app.js?v=1.1.1', 'config.js?v=1.1.1', 'supabase.min.js', 'manifest.webmanifest',
+  'icon-192.png', 'icon-512.png', 'apple-touch-icon.png', 'favicon-32.png', 'logo.svg',
+  'figtree-latin-400-normal.woff2', 'figtree-latin-500-normal.woff2', 'figtree-latin-600-normal.woff2', 'figtree-latin-700-normal.woff2',
+  'bricolage-grotesque-latin-600-normal.woff2', 'bricolage-grotesque-latin-700-normal.woff2',
+  'ibm-plex-mono-latin-400-normal.woff2', 'ibm-plex-mono-latin-500-normal.woff2'
 ];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));

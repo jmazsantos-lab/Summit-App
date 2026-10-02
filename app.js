@@ -165,21 +165,22 @@ async function loadAll(){
   const chk=await sb.from('profiles').select('id').eq('id',ME).maybeSingle();
   if(chk.error)throw chk.error;
   if(!chk.data){const r=await sb.rpc('iniciar_cuenta',{p_name:MENAME||''});if(r.error)throw r.error}
-  const [prof,areas,projects,members,tasks,focus,sc]=await Promise.all([
+  const [prof,areas,projects,members,tasks,focus,sc,ck]=await Promise.all([
     sb.from('profiles').select('*').eq('id',ME).maybeSingle(),
     fetchAll('areas',q=>q.eq('user_id',ME).order('position')),
     fetchAll('projects',q=>q.order('position').order('created_at')),
     fetchAll('project_members'),
     fetchAll('tasks',q=>q.order('created_at')),
     fetchAll('focus_sessions',q=>q.eq('user_id',ME)),
-    sb.from('shortcut_codes').select('user_id').eq('user_id',ME).maybeSingle()
+    sb.from('shortcut_codes').select('user_id').eq('user_id',ME).maybeSingle(),
+    sb.from('claude_keys').select('user_id,last_used').eq('user_id',ME).maybeSingle()
   ]);
   if(prof.error)throw prof.error;
   const p=prof.data||{name:'',settings:{}};const st=p.settings||{};
   const next={me:{name:p.name||MEMAIL.split('@')[0],email:MEMAIL},
     settings:Object.assign({},DEF_SETTINGS,st),contexts:st.contexts||DEF_CONTEXTS.slice(),filters:st.filters||[],reviews:st.reviews||[],reviewChecks:st.reviewChecks||{},
     areas:areas.map(a=>({id:a.id,name:a.name,position:a.position})),projects:projects.map(rowToProject),members:{},
-    tasks:tasks.map(rowToTask),focusLog:focus.map(r=>({id:r.id,date:r.day,min:r.minutes,taskId:r.task_id,projectId:r.project_id})),hasShortcut:!!(sc&&sc.data)};
+    tasks:tasks.map(rowToTask),focusLog:focus.map(r=>({id:r.id,date:r.day,min:r.minutes,taskId:r.task_id,projectId:r.project_id})),hasShortcut:!!(sc&&sc.data),hasClaude:!!(ck&&ck.data),claudeUsed:ck&&ck.data?ck.data.last_used:null};
   delete next.settings.contexts;delete next.settings.filters;delete next.settings.reviews;delete next.settings.reviewChecks;
   members.forEach(m=>{(next.members[m.project_id]=next.members[m.project_id]||[]).push({userId:m.user_id,name:m.display_name,role:m.role})});
   const pids=new Set(next.projects.map(x=>x.id));next.tasks.forEach(t=>{if(t.projectId&&!pids.has(t.projectId)){t.projectId=null;t.section=null}});
@@ -741,7 +742,7 @@ function renderNotif(){
 
 /* ================== Acciones ================== */
 function toast(msg,o={}){const d=document.createElement('div');d.className='toast'+(o.warn?' warn':'');d.innerHTML=`${ic(o.icon||'check',18)}<span class="tx">${msg}</span>${o.btn?`<button>${o.btn}</button>`:''}`;if(o.btn)d.querySelector('button').onclick=()=>{o.fn&&o.fn();d.remove()};$('#toasts').appendChild(d);setTimeout(()=>d.remove(),o.ms||4200)}
-function notify(title,body,o={}){toast(`<b>${esc(title)}</b> · ${esc(body)}`,o);try{if(S&&S.settings.sysNotif&&'Notification' in window&&Notification.permission==='granted'&&navigator.serviceWorker)navigator.serviceWorker.ready.then(r=>r.showNotification(title,{body,icon:'icons/icon-192.png',badge:'icons/icon-192.png'}))}catch(e){}}
+function notify(title,body,o={}){toast(`<b>${esc(title)}</b> · ${esc(body)}`,o);try{if(S&&S.settings.sysNotif&&'Notification' in window&&Notification.permission==='granted'&&navigator.serviceWorker)navigator.serviceWorker.ready.then(r=>r.showNotification(title,{body,icon:'icon-192.png',badge:'icon-192.png'}))}catch(e){}}
 function complete(t){
   if(t.status==='done'){t.status='open';t.completed=null;t.completedBy=null;save();render();return}
   const prev=JSON.parse(JSON.stringify(t));
@@ -931,6 +932,7 @@ function openProjectModal(id){
   <label class="field"><span>Resultado deseado</span><input class="inp" id="pm-goal" value="${esc(p?.goal||'')}" placeholder="¿Cómo sabrás que está terminado?"></label>
   <div class="frow"><label class="field"><span>Área</span><select class="inp" id="pm-area">${S.areas.map(a=>`<option value="${a.id}" ${p?.area===a.id?'selected':''}>${esc(a.name)}</option>`).join('')}</select></label>
   <label class="field"><span>Revisar cada</span><select class="inp" id="pm-rev">${[[7,'Semana'],[14,'2 semanas'],[30,'Mes']].map(([n,l])=>`<option value="${n}" ${(p?.reviewEvery||7)==n?'selected':''}>${l}</option>`).join('')}</select></label></div>
+  ${p?'':`<label class="ck" style="padding:4px 0"><input type="checkbox" id="pm-share"><span><b>Compartir con otras personas</b><br><span class="cap">Genera un código para que otra persona se una y añada tareas</span></span></label>`}
   ${p?'':`<label class="field"><span>Plantilla</span><select class="inp" id="pm-tpl">${Object.entries(TPL).map(([k,v])=>`<option value="${k}">${v.n}</option>`).join('')}</select></label>`}
   <div class="field"><span class="flabel">Color</span><div class="swatches">${COLORS.map((c,i)=>`<button style="--c:${c}" class="${(p?p.color===c:i===0)?'on':''}" data-act="swatch" data-c="${c}" aria-label="Color ${i+1}"></button>`).join('')}</div></div></div>
   ${p?`<div class="row">${p.status!=='active'?`<button class="btn sm" data-act="projStatus" data-id="${p.id}" data-v="active">Reactivar</button>`:`<button class="btn sm" data-act="projStatus" data-id="${p.id}" data-v="paused">Poner en pausa</button><button class="btn sm" data-act="projStatus" data-id="${p.id}" data-v="done">${ic('check',15)} Completar proyecto</button>`}</div>`:''}
@@ -945,7 +947,9 @@ function saveProject(id){
   else{const tp=TPL[$('#pm-tpl').value];const p={id:uid(),ownerId:ME,shareCode:null,position:S.projects.length,name,goal:$('#pm-goal').value.trim(),area:$('#pm-area').value,color,sections:[...tp.s],status:'active',reviewEvery:+$('#pm-rev').value,lastReview:TODAY};S.projects.push(p);
     tp.t.forEach(([ti,se])=>S.tasks.push(newTask({title:ti,projectId:p.id,section:se,priority:3})));
     U.view='project';U.project=p.id}
+  const share=!id&&$('#pm-share')&&$('#pm-share').checked;const newId=U.project;
   save();closeModal();render();toast(id?'Proyecto actualizado':'Proyecto creado: '+esc(name));
+  if(share){(async()=>{try{await flush();const c=await rpc('compartir_proyecto',{p_project:newId,p_nuevo:false});const pp=proj(newId);if(pp){pp.shareCode=c;persistLocal();openShareModal(newId);render()}}catch(e){toast('El proyecto se ha creado, pero no se pudo generar el código: '+esc(e.message),{icon:'close',warn:true})}})()}
 }
 function openFilterModal(){
   modal(`<h2>Nuevo filtro</h2><div class="stack"><label class="field"><span>Nombre</span><input class="inp" id="fm-name" placeholder="Ej.: Cosas rápidas en planta"></label>
@@ -975,6 +979,7 @@ V.settings=()=>{
   const sw=(k)=>`<button class="switch ${s[k]?'on':''}" data-act="toggleSet" data-k="${k}" role="switch" aria-checked="${!!s[k]}" aria-label="${k}"></button>`;
   const base=(CFG.SUPABASE_URL||'').replace(/\/+$/,'');
   let code='';try{code=localStorage.getItem('summit-sc-'+ME)||''}catch(e){}
+  let ck='';try{ck=localStorage.getItem('summit-ck-'+ME)||''}catch(e){}
   const copyRow=(l,v,id,hint)=>`<div class="set"><div class="l" style="min-width:0"><b>${l}</b><span class="mono" style="overflow-wrap:anywhere" id="${id}">${esc(v)}</span>${hint?`<span>${hint}</span>`:''}</div><button class="btn sm" data-act="copyTxt" data-src="${id}">${ic('copy',15)} Copiar</button></div>`;
   return vh('Ajustes')+
   `<div class="stack">
@@ -1026,6 +1031,18 @@ V.settings=()=>{
       <li>Añade <b>Mostrar notificación</b> con la variable <b>Contenido de la URL</b>.</li>
       <li>Cada mañana recibirás, por ejemplo: «Summit · Hoy: 3 tareas · Vencidas: 1», con las fechas límite de los próximos días.</li>
     </ol></details></div>
+  <div class="card"><h3>${ic('sparkle',17)} Conector de Claude</h3>
+    <p class="cap" style="margin:4px 0 10px">Conecta Summit con Claude para preguntarle por tus tareas, proyectos y estadísticas, o pedirle que cree y organice cosas por ti. Claude solo ve lo mismo que tú ves en Summit.</p>
+    ${ck?copyRow('URL del conector',base+'/functions/v1/summit-mcp?key='+ck,'ck-url','Solo se muestra en este dispositivo. Pégala en Claude y no la compartas: da acceso a tu Summit.'):''}
+    <div class="set"><div class="l"><b>Clave del conector</b><span>${S.hasClaude?('Activa'+(S.claudeUsed?' · último uso: '+fmtDate(iso(new Date(S.claudeUsed))).toLowerCase():' · aún sin usar')+'. Si la revocas, Claude pierde el acceso al momento.'):'Genera la clave para obtener la URL del conector.'}</span></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn sm ${S.hasClaude?'':'primary'}" data-act="ckNew">${S.hasClaude?'Generar nueva':'Generar clave'}</button>${S.hasClaude?'<button class="btn sm danger" data-act="ckRevoke">Revocar</button>':''}</div></div>
+    <details class="more" data-key="ckSteps" ${U.ckSteps?'open':''} style="margin-top:6px"><summary>Cómo añadirlo en Claude (1 minuto)</summary>
+    <ol class="steps">
+      <li>Pulsa <b>Generar clave</b> y copia la <b>URL del conector</b>.</li>
+      <li>En Claude (web o app de escritorio), ve a <b>Personalizar → Conectores</b>, pulsa <b>+</b> y elige <b>Añadir conector personalizado</b>.</li>
+      <li>Nombre: <b>Summit</b>. URL: pega la que has copiado. Autenticación: <b>sin inicio de sesión</b>. Guarda.</li>
+      <li>En una conversación, activa el conector Summit y pregunta, por ejemplo: «¿Qué tengo esta semana?» o «Crea un proyecto para el viaje a Valladolid con 5 tareas y compártelo».</li>
+    </ol>
+    <p class="cap" style="margin:0 0 6px">Una vez añadido, también funciona en la app de Claude del iPhone. El plan gratuito de Claude permite un conector personalizado.</p></details></div>
   <div class="card"><h3>${ic('copy',17)} Datos</h3>
     <div class="set"><div class="l"><b>Copia de seguridad</b><span>Descarga todos tus datos en un archivo JSON</span></div><button class="btn sm" data-act="exportJson">Descargar</button></div>
     <div class="set"><div class="l"><b>Estado de sincronización</b><span>${QUEUE.length?QUEUE.length+' cambios pendientes de enviar':'Todo guardado en la nube'}</span></div><button class="btn sm" data-act="syncNow">Sincronizar</button></div></div>
@@ -1067,6 +1084,8 @@ A.joinGo=async()=>{const c=$('#join-code').value.trim();if(!c)return;try{await f
 
 /* ---------- Acciones de ajustes y cuenta ---------- */
 A.logout=()=>signOut();
+A.ckNew=async el=>{if(S.hasClaude&&!el.dataset.ok){el.dataset.ok='1';el.textContent='Pulsa otra vez: la URL anterior dejará de funcionar';return}try{const c=await rpc('generar_clave_claude');try{localStorage.setItem('summit-ck-'+ME,c)}catch(e){}S.hasClaude=true;S.claudeUsed=null;U.ckSteps=true;renderView();toast('Clave generada. Copia la URL del conector en Claude.')}catch(e){toast(esc(e.message),{icon:'close',warn:true})}};
+A.ckRevoke=async el=>{if(!el.dataset.ok){el.dataset.ok='1';el.textContent='Pulsa otra vez para revocar';return}try{await rpc('revocar_clave_claude');try{localStorage.removeItem('summit-ck-'+ME)}catch(e){}S.hasClaude=false;renderView();toast('Claude ya no tiene acceso a tu Summit.',{icon:'close'})}catch(e){toast(esc(e.message),{icon:'close',warn:true})}};
 A.syncNow=async()=>{await flush();try{await loadAll();render();toast(QUEUE.length?'Quedan cambios pendientes: sin conexión':'Sincronizado')}catch(e){toast('Sin conexión',{icon:'cloud'})}};
 A.scNew=async()=>{try{const c=await rpc('generar_codigo_atajo');try{localStorage.setItem('summit-sc-'+ME,c)}catch(e){}S.hasShortcut=true;U.scSteps=true;renderView();toast('Código generado. Cópialo en tus atajos.')}catch(e){toast(esc(e.message),{icon:'close',warn:true})}};
 A.scRevoke=async el=>{if(!el.dataset.ok){el.dataset.ok='1';el.textContent='Pulsa otra vez para revocar';return}try{await rpc('revocar_codigo_atajo');try{localStorage.removeItem('summit-sc-'+ME)}catch(e){}S.hasShortcut=false;renderView();toast('Código revocado. Tus atajos dejarán de funcionar hasta que pongas uno nuevo.',{icon:'close'})}catch(e){toast(esc(e.message),{icon:'close',warn:true})}};
@@ -1089,7 +1108,7 @@ document.addEventListener('keydown',e=>{
 A.askPerm=async()=>{try{if(!('Notification' in window))throw 0;let p=Notification.permission;if(p==='default')p=await Notification.requestPermission();if(p!=='granted')throw 0;S.settings.sysNotif=true;save();notify('Summit','Notificaciones activadas')}catch(e){toast('Este navegador no permite notificaciones. En iPhone, instala Summit en la pantalla de inicio y usa el resumen diario del atajo.',{icon:'bell',ms:7000})}renderView()};
 
 /* ================== Arranque ================== */
-const APP_VERSION='1.0.1';
+const APP_VERSION='1.1.1';
 function afterStart(){
   const q=new URLSearchParams(location.search);
   const add=q.get('add'),view=q.get('view');
@@ -1099,6 +1118,10 @@ function afterStart(){
   if(location.hash&&/access_token|type=/.test(location.hash))history.replaceState(null,'',location.pathname);
   const a=alerts().filter(x=>x.k!=='rem');
   if(a.length){const x=a[0];setTimeout(()=>notify(x.k==='overdue'?'Fecha límite vencida':x.k==='today'?'Fecha límite hoy':'Fecha límite próxima',x.t.title+' · '+x.txt,{warn:true,icon:'flag',btn:'Ver',fn:()=>{U.sel=x.t.id;render()},ms:7000}),1400)}
+}
+function showLibError(){
+  const a=$('#auth');a.hidden=false;$('#app').hidden=true;
+  a.innerHTML=`<div class="auth-card">${LOGO.replace('<svg','<svg class="auth-logo"')}<h1>Summit</h1><p>No se ha podido cargar el archivo <b>supabase.min.js</b>. Comprueba que está subido en la raíz del repositorio de GitHub, junto a index.html, y vuelve a abrir Summit.</p><button class="btn primary auth-go" onclick="location.reload()">Reintentar</button></div>`;
 }
 function showConfigError(){
   const a=$('#auth');a.hidden=false;$('#app').hidden=true;
@@ -1115,7 +1138,8 @@ applyTheme();
 })();
 if('serviceWorker' in navigator)window.addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{}));
 (async function boot(){
-  if(!window.supabase||!CFG.SUPABASE_URL||/TU-PROYECTO/i.test(CFG.SUPABASE_URL)||!CFG.SUPABASE_ANON_KEY||/TU-CLAVE/i.test(CFG.SUPABASE_ANON_KEY)){showConfigError();return}
+  if(!window.supabase){showLibError();return}
+  if(!CFG.SUPABASE_URL||/TU-PROYECTO/i.test(CFG.SUPABASE_URL)||!CFG.SUPABASE_ANON_KEY||/TU-CLAVE/i.test(CFG.SUPABASE_ANON_KEY)){showConfigError();return}
   sb=window.supabase.createClient(CFG.SUPABASE_URL.replace(/\/+$/,'').replace(/\/rest\/v1$/,''),CFG.SUPABASE_ANON_KEY,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true},db:{schema:'summit',retry:false}});
   const recovering=/type=recovery/.test(location.hash);
   sb.auth.onAuthStateChange(ev=>{if(ev==='PASSWORD_RECOVERY')setTimeout(()=>showAuth('newpass'),0)});

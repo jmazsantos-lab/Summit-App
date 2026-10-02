@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Summit</title>
+<meta name="description" content="Summit: tareas y proyectos con el método GTD.">
+<meta name="theme-color" content="#EFF2EE" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#121815" media="(prefers-color-scheme: dark)">
+<meta name="color-scheme" content="light dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Summit">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
+<link rel="icon" type="image/svg+xml" href="icons/logo.svg">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="preload" href="fonts/figtree-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="styles.css?v=1.0.1">
+</head>
+<body>
+<div id="splash" aria-hidden="true">
+  <svg class="mark" viewBox="0 0 120 120"><rect width="120" height="120" rx="27" fill="#EEF2EC"/><rect x=".75" y=".75" width="118.5" height="118.5" rx="26.3" fill="none" stroke="#1D1D1F" stroke-opacity=".07" stroke-width="1.5"/><circle class="ping" cx="96" cy="34" r="7" fill="none" stroke="#5F7F6A" stroke-width="3"/><path class="ck" d="M22 68l20 20 19-28 12 12 23-38" stroke="#5F7F6A" stroke-width="10" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  <div class="word">Summit</div>
+</div>
+<div id="auth" hidden></div>
+<div class="app" id="app" hidden>
+  <aside id="sidebar" aria-label="Navegación"></aside>
+  <div id="dscrim" data-act="drawer"></div>
+  <main id="main">
+    <div class="topbar">
+      <button class="iconbtn menu-btn" data-act="drawer" aria-label="Abrir menú"></button>
+      <div class="sp"></div>
+      <button class="focus-pill" id="fpill" data-act="nav" data-view="focus"></button>
+      <button class="iconbtn" data-act="palette" aria-label="Buscar" id="b-search"></button>
+      <button class="iconbtn" data-act="bell" aria-label="Notificaciones" id="b-bell"></button>
+      <button class="btn primary add-top" data-act="quick" id="b-add"></button>
+    </div>
+    <div id="view"></div>
+  </main>
+  <aside id="detail" hidden aria-label="Detalle de la tarea"></aside>
+</div>
+<nav class="tabbar" id="tabbar" hidden aria-label="Accesos rápidos"></nav>
+<button class="fab" data-act="quick" aria-label="Añadir tarea" id="fab" hidden></button>
+<div id="modal" hidden></div>
+<div id="notif" hidden></div>
+<div id="toasts" aria-live="polite"></div>
+<script src="lib/supabase.min.js"></script>
+<script src="config.js?v=1.0.1"></script>
+<script src="app.js?v=1.0.1"></script>
+</body>
+</html>

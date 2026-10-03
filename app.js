@@ -132,7 +132,7 @@ function save(){
 }
 const isNetErr=e=>!e.code&&/fetch|network|load failed|timeout|abort/i.test(String(e.message||e));
 async function flush(){
-  if(flushing||!sb||!QUEUE.length)return;flushing=true;setSync('saving');
+  if(flushing||!sb||!QUEUE.length)return;flushing=true;setSync('saving');let authRetries=0;
   try{
     while(QUEUE.length){
       const op=QUEUE[0];let res;
@@ -142,17 +142,52 @@ async function flush(){
         else res=await sb.from(op.t).delete().eq('id',op.id);
       }catch(e){res={error:e}}
       if(res.error){
-        if(isNetErr(res.error)){setSync('offline');break}
-        if(res.error.code!=='23505'){console.warn('Summit: cambio descartado',op,res.error);if(!warned){warned=true;toast('No se pudo guardar un cambio: '+esc(res.error.message||'error'),{icon:'close',warn:true})}}
+        const st=res.status||0,er=res.error;
+        if(isNetErr(er)||st===0||st>=500||st===408||st===429){setSync('offline');break}
+        if(st===401||er.code==='PGRST301'||er.code==='PGRST303'||/jwt|token/i.test(er.message||'')){
+          const ok=authRetries++<2?await ensureSession():'offline';if(ok==='ok')continue;setSync('offline');if(ok==='expired')sessionExpired();break}
+        if(er.code!=='23505'){console.warn('Summit: cambio descartado',op,res.error);if(!warned){warned=true;toast('No se pudo guardar un cambio: '+esc(res.error.message||'error'),{icon:'close',warn:true})}}
       }
       QUEUE.shift();persistLocal();
     }
     if(!QUEUE.length)setSync('ok');
   }finally{flushing=false}
 }
-function setSync(s){const el=$('#sync');if(!el)return;el.dataset.s=s;el.title=({ok:'Todo guardado',saving:'Guardando…',offline:'Sin conexión: los cambios se enviarán al volver la red'})[s]||''}
-window.addEventListener('online',()=>flush());
-setInterval(()=>{if(QUEUE.length)flush()},30000);
+function setSync(s){const t=({ok:'Todo guardado',saving:'Sincronizando…',offline:'Sin conexión: tus cambios se guardan aquí y se envían al volver la red'})[s]||'';const el=$('#sync');if(el){el.dataset.s=s;el.title=t}const pill=$('#netpill');if(pill){pill.hidden=s!=='offline';pill.title=t}}
+/* ---------- Sincronización: se intenta al abrir, al volver la red y cada 30 s ---------- */
+let SYNC_FAIL=false,syncing=false,expiredShown=false;
+async function ensureSession(){
+  if(!sb)return 'offline';
+  try{
+    const r=await sb.auth.getSession();
+    if(r.data&&r.data.session){const exp=(r.data.session.expires_at||0)*1000;if(!exp||exp-Date.now()>30000)return 'ok'}
+    if(r.error&&isNetErr(r.error))return 'offline';
+    const rf=await sb.auth.refreshSession();
+    if(rf.data&&rf.data.session)return 'ok';
+    if(rf.error&&(isNetErr(rf.error)||rf.error.name==='AuthRetryableFetchError'||!rf.error.status||rf.error.status>=500))return 'offline';
+    return 'expired';
+  }catch(e){return 'offline'}
+}
+function sessionExpired(){if(expiredShown)return;expiredShown=true;toast('Tu sesión ha caducado. Entra de nuevo para sincronizar (no se pierde nada).',{icon:'user',btn:'Entrar',ms:15000,fn:()=>{expiredShown=false;showAuth('login')}})}
+async function syncAll(force){
+  if(syncing||!sb||!ME||!S)return;syncing=true;
+  try{
+    if(navigator.onLine===false){SYNC_FAIL=true;setSync('offline');return}
+    const ss=await ensureSession();
+    if(ss!=='ok'){SYNC_FAIL=true;setSync('offline');if(ss==='expired')sessionExpired();return}
+    await flush();
+    if(QUEUE.length){SYNC_FAIL=true;return}
+    if(busyEditing()){setTimeout(()=>syncAll(force),2500);return}
+    await withTimeout(loadAll(),20000);refreshToday();render();SYNC_FAIL=false;setSync('ok');
+    if(!RT)subscribeLive();
+  }catch(e){if(isSchemaErr(e)){showSchemaError();return}SYNC_FAIL=true;setSync('offline')}
+  finally{syncing=false}
+}
+const withTimeout=(p,ms)=>Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),ms))]);
+function busyEditing(){const a=document.activeElement;return !$('#modal').hidden||!!(a&&a.closest&&a.closest('#detail')&&/INPUT|TEXTAREA|SELECT/.test(a.tagName))}
+window.addEventListener('online',()=>{setSync('saving');syncAll(true)});
+window.addEventListener('offline',()=>setSync('offline'));
+setInterval(()=>{if(QUEUE.length||SYNC_FAIL)syncAll()},30000);
 
 /* ---------- Carga desde Supabase ---------- */
 async function fetchAll(table,build){
@@ -197,31 +232,30 @@ async function loadAll(){
 }
 function loadCache(){try{const c=JSON.parse(localStorage.getItem(cacheKey())||'null');if(!c||!c.S)return false;S=c.S;SHADOW.tasks=new Map(c.shadow.tasks);SHADOW.projects=new Map(c.shadow.projects);SHADOW.areas=new Map(c.shadow.areas);SHADOW.focus_sessions=new Map(c.shadow.focus_sessions);SHADOW.profile=c.shadow.profile;return true}catch(e){return false}}
 let reloadTimer=null;
-function softReload(){clearTimeout(reloadTimer);reloadTimer=setTimeout(async()=>{
-  if(!sb||!ME||QUEUE.length||flushing)return;
-  const a=document.activeElement;if(!$('#modal').hidden||(a&&a.closest&&a.closest('#detail')&&/INPUT|TEXTAREA/.test(a.tagName))){softReload();return}
-  try{await loadAll();refreshToday();render()}catch(e){}
-},1200)}
+function softReload(){clearTimeout(reloadTimer);reloadTimer=setTimeout(()=>syncAll(),1200)}
 function subscribeLive(){
   try{if(RT)sb.removeChannel(RT);RT=sb.channel('summit-'+ME);['tasks','projects','project_members'].forEach(tb=>RT.on('postgres_changes',{event:'*',schema:'summit',table:tb},()=>softReload()));RT.subscribe()}catch(e){}
 }
 function refreshToday(){const t=iso(new Date());if(t!==TODAY){TODAY=t}}
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&S){refreshToday();flush().then(softReload)}});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&S){refreshToday();render();syncAll()}});
 
 /* ---------- Cuentas ---------- */
+let RESET_EMAIL='';
 function showAuth(mode,msg){
   $('#app').hidden=true;$('#tabbar').hidden=true;$('#fab').hidden=true;const a=$('#auth');a.hidden=false;
-  const f={login:['Entrar','Entra con tu cuenta de Summit.'],signup:['Crear cuenta','Cada persona tiene su propia cuenta y sus datos son privados.'],reset:['Recuperar contraseña','Te enviaremos un enlace para crear una nueva.'],newpass:['Nueva contraseña','Escribe tu nueva contraseña.']}[mode];
+  const f={login:['Entrar',''],signup:['Crear cuenta',''],reset:['Enviar código','Te enviaremos un código por correo.'],code:['Cambiar contraseña','Escribe el código del correo.'],newpass:['Nueva contraseña','']}[mode];
   a.innerHTML=`<form class="auth-card" id="auth-form" data-mode="${mode}" novalidate>
-    ${LOGO.replace('<svg','<svg class="auth-logo"')}<h1>Summit</h1><p>${f[1]}</p>
+    ${LOGO.replace('<svg','<svg class="auth-logo"')}<h1>Summit</h1>${f[1]?`<p>${f[1]}</p>`:''}
     ${mode==='login'||mode==='signup'?`<div class="seg auth-seg"><button type="button" class="${mode==='login'?'on':''}" data-auth="login">Entrar</button><button type="button" class="${mode==='signup'?'on':''}" data-auth="signup">Crear cuenta</button></div>`:''}
     ${mode==='signup'?`<label class="field"><span>Tu nombre</span><input class="inp" id="au-name" autocomplete="name" required></label>`:''}
-    ${mode!=='newpass'?`<label class="field"><span>Correo electrónico</span><input class="inp" id="au-email" type="email" autocomplete="email" required></label>`:''}
-    ${mode!=='reset'?`<label class="field"><span>Contraseña</span><input class="inp" id="au-pass" type="password" autocomplete="${mode==='login'?'current-password':'new-password'}" minlength="8" required></label>`:''}
+    ${mode==='code'?`<label class="field"><span>Código del correo</span><input class="inp mono" id="au-code" inputmode="numeric" autocomplete="one-time-code" maxlength="10" style="font-size:20px;letter-spacing:.2em;text-align:center" required></label>`:''}
+    ${mode!=='newpass'&&mode!=='code'?`<label class="field"><span>Correo electrónico</span><input class="inp" id="au-email" type="email" autocomplete="email" required></label>`:''}
+    ${mode!=='reset'?`<label class="field"><span>${mode==='code'||mode==='newpass'?'Nueva contraseña':'Contraseña'}</span><input class="inp" id="au-pass" type="password" autocomplete="${mode==='login'?'current-password':'new-password'}" minlength="8" required></label>`:''}
     <p class="auth-msg ${msg&&msg.err?'err':''}" id="au-msg">${msg?esc(msg.text):''}</p>
     <button class="btn primary auth-go" type="submit">${f[0]}</button>
     ${mode==='login'?'<button type="button" class="linkbtn" data-auth="reset">¿Has olvidado la contraseña?</button>':''}
-    ${mode==='reset'?'<button type="button" class="linkbtn" data-auth="login">Volver</button>':''}
+    ${mode==='reset'?'<button type="button" class="linkbtn" data-auth="code">Ya tengo un código</button><button type="button" class="linkbtn" data-auth="login">Volver</button>':''}
+    ${mode==='code'?`<p class="auth-msg" style="text-align:center">${RESET_EMAIL?'Enviado a '+esc(RESET_EMAIL)+' · ':''}<button type="button" class="linkbtn" data-auth="reset">Pedir otro código</button></p>`:''}
   </form>`;
 }
 function authMsg(text,err){const m=$('#au-msg');if(m){m.textContent=text;m.classList.toggle('err',!!err)}}
@@ -235,23 +269,39 @@ document.addEventListener('submit',async e=>{
     if(mode==='signup'){if(!v('#au-name'))throw new Error('Escribe tu nombre');if($('#au-pass').value.length<8)throw new Error('La contraseña debe tener al menos 8 caracteres');
       const{data,error}=await sb.auth.signUp({email:v('#au-email'),password:$('#au-pass').value,options:{data:{name:v('#au-name')},emailRedirectTo:redirect}});if(error)throw error;
       if(data.session)await start(data.user);else showAuth('login',{text:'Cuenta creada. Te hemos enviado un correo: abre el enlace para confirmarla y después entra aquí.'})}
-    if(mode==='reset'){const{error}=await sb.auth.resetPasswordForEmail(v('#au-email'),{redirectTo:redirect});if(error)throw error;authMsg('Si el correo existe, te llegará un enlace en unos minutos.')}
+    if(mode==='reset'){const em=v('#au-email');if(!em)throw new Error('Escribe tu correo');const{error}=await sb.auth.resetPasswordForEmail(em,{redirectTo:redirect});if(error)throw error;RESET_EMAIL=em;showAuth('code',{text:'Si el correo tiene cuenta, te llegará un código en unos minutos. Revisa también la carpeta de spam.'});return}
+    if(mode==='code'){const code=v('#au-code').replace(/\s/g,'');if(!RESET_EMAIL)throw new Error('Vuelve atrás y escribe tu correo para pedir el código');if(!/^\d{6,10}$/.test(code))throw new Error('El código son los números que aparecen en el correo');if($('#au-pass').value.length<8)throw new Error('La contraseña debe tener al menos 8 caracteres');
+      const r=await sb.auth.verifyOtp({email:RESET_EMAIL,token:code,type:'recovery'});if(r.error)throw r.error;const u2=await sb.auth.updateUser({password:$('#au-pass').value});if(u2.error)throw u2.error;toast('Contraseña cambiada. Guárdala cuando Safari te lo ofrezca.');await start(u2.data.user);return}
     if(mode==='newpass'){if($('#au-pass').value.length<8)throw new Error('La contraseña debe tener al menos 8 caracteres');const{data,error}=await sb.auth.updateUser({password:$('#au-pass').value});if(error)throw error;toast('Contraseña actualizada');await start(data.user)}
   }catch(err){authMsg(traducir(err.message),true)}finally{if(btn)btn.disabled=false}
 });
-function traducir(m){m=String(m||'');if(/invalid login/i.test(m))return 'Correo o contraseña incorrectos.';if(/email not confirmed/i.test(m))return 'Confirma tu correo: abre el enlace que te enviamos.';if(/already registered|already exists/i.test(m))return 'Ya existe una cuenta con ese correo. Entra o recupera la contraseña.';if(/rate limit/i.test(m))return 'Demasiados intentos. Espera unos minutos.';if(/fetch|network|load failed/i.test(m))return 'Sin conexión. Comprueba tu red e inténtalo de nuevo.';if(/signups not allowed|signup is disabled/i.test(m))return 'El registro está cerrado. Pide una invitación a quien administra Summit.';return m}
-async function start(user){
+function traducir(m){m=String(m||'');if(/token has expired|otp_expired|invalid.*(otp|token)|Token has expired or is invalid/i.test(m))return 'El código no es válido o ha caducado. Pide otro código.';if(/same.*password|different from the old/i.test(m))return 'La contraseña nueva debe ser distinta de la anterior.';if(/weak|at least/i.test(m)&&/password/i.test(m))return 'La contraseña es demasiado débil. Usa al menos 8 caracteres con letras y números.';if(/invalid login/i.test(m))return 'Correo o contraseña incorrectos.';if(/email not confirmed/i.test(m))return 'Confirma tu correo: abre el enlace que te enviamos.';if(/already registered|already exists/i.test(m))return 'Ya existe una cuenta con ese correo. Entra o recupera la contraseña.';if(/rate limit/i.test(m))return 'Demasiados intentos. Espera unos minutos.';if(/fetch|network|load failed/i.test(m))return 'Sin conexión. Comprueba tu red e inténtalo de nuevo.';if(/signups not allowed|signup is disabled/i.test(m))return 'El registro está cerrado. Pide una invitación a quien administra Summit.';return m}
+const LASTKEY='summit-last-user';
+function rememberUser(u){try{localStorage.setItem(LASTKEY,JSON.stringify({id:u.id,email:u.email||'',user_metadata:{name:(u.user_metadata&&u.user_metadata.name)||''}}))}catch(e){}}
+function lastUser(){try{return JSON.parse(localStorage.getItem(LASTKEY)||'null')}catch(e){return null}}
+function hasCacheFor(id){try{return !!localStorage.getItem('summit-cache-'+id)}catch(e){return false}}
+function showApp(){$('#auth').hidden=true;$('#app').hidden=false;$('#tabbar').hidden=false;$('#fab').hidden=false;applyTheme();render();fUpdate()}
+async function start(user,offline){
+  const same=ME===user.id&&S;
   ME=user.id;MEMAIL=user.email||'';MENAME=(user.user_metadata&&user.user_metadata.name)||'';
+  rememberUser(user);
   try{QUEUE=JSON.parse(localStorage.getItem(queueKey())||'[]')}catch(e){QUEUE=[]}
-  let ok=false;
-  try{if(navigator.onLine===false)throw new Error('offline');if(QUEUE.length)await flush();await Promise.race([loadAll(),new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),9000))]);ok=true}catch(e){console.warn(e);if(isSchemaErr(e)){showSchemaError();return}if(loadCache()){ok=true;setTimeout(()=>toast('Sin conexión: trabajas con los datos de este dispositivo. Se sincronizará al volver la red.',{icon:'cloud',ms:6000}),900)}}
-  if(!ok){showAuth('login',{text:'No se pudo conectar con Summit. Comprueba tu conexión.',err:true});return}
-  $('#auth').hidden=true;$('#app').hidden=false;$('#tabbar').hidden=false;$('#fab').hidden=false;
-  applyTheme();render();fUpdate();subscribeLive();afterStart();
+  if(same||loadCache()){
+    // Abre al instante con los datos del dispositivo y sincroniza en segundo plano
+    showApp();afterStart();setSync(offline||navigator.onLine===false?'offline':'saving');
+    if(!offline)syncAll(true);else SYNC_FAIL=true;
+    return;
+  }
+  if(offline){showAuth('login',{text:'Sin conexión. La primera vez necesitas internet para descargar tus datos.',err:true});return}
+  try{await withTimeout(loadAll(),20000)}catch(e){console.warn(e);if(isSchemaErr(e)){showSchemaError();return}showAuth('login',{text:'No se pudo conectar. La primera vez necesitas internet para descargar tus datos.',err:true});return}
+  showApp();setSync('ok');subscribeLive();afterStart();
 }
 function isSchemaErr(e){const m=String((e&&(e.message||e.hint))||'');return (e&&e.code==='PGRST106')||/schema must be one of|Invalid schema|exposed schemas/i.test(m)}
 function showSchemaError(){$('#app').hidden=true;$('#tabbar').hidden=true;$('#fab').hidden=true;const a=$('#auth');a.hidden=false;a.innerHTML=`<div class="auth-card">${LOGO.replace('<svg','<svg class="auth-logo"')}<h1>Summit</h1><p>Falta un paso en Supabase: en <b>Project Settings → Data API → Exposed schemas</b>, añade <b>summit</b> y pulsa <b>Save</b>. Después vuelve a abrir Summit.</p><button class="btn primary auth-go" onclick="location.reload()">Reintentar</button></div>`}
-async function signOut(){try{await sb.auth.signOut()}catch(e){}try{localStorage.removeItem(cacheKey());localStorage.removeItem(queueKey())}catch(e){}location.replace(location.pathname)}
+async function signOut(){
+  if(QUEUE.length&&!confirmSignOut){confirmSignOut=true;toast('Hay '+QUEUE.length+' cambios sin enviar. Conéctate antes de cerrar sesión o pulsa otra vez para descartarlos.',{icon:'cloud',warn:true,ms:8000});setTimeout(()=>confirmSignOut=false,8000);return}
+  try{await sb.auth.signOut()}catch(e){}try{localStorage.removeItem(cacheKey());localStorage.removeItem(queueKey());localStorage.removeItem(LASTKEY)}catch(e){}location.replace(location.pathname)}
+let confirmSignOut=false;
 
 /* ================== Consultas ================== */
 function alerts(){
@@ -423,8 +473,8 @@ function vh(title,sub,act=''){return `<div class="vh"><div><h1>${title}</h1>${su
 const V={};
 V.inbox=()=>{
   const ts=myT().filter(t=>t.inbox&&isOpen(t));
-  return vh('Bandeja',ts.length?ts.length+(ts.length===1?' elemento por procesar':' elementos por procesar'):'',ts.length?`<button class="btn primary" data-act="clarify">Procesar</button>`:'')+
-  (ts.length?ts.map(t=>taskRow(t)).join('')+`<button class="addrow" data-act="quick">${ic('plus',16)} Capturar algo</button>`:empty('Bandeja vacía','Todo lo capturado está procesado.'));
+  return vh('Bandeja','',ts.length?`<button class="btn primary" data-act="clarify">Procesar</button>`:'')+
+  (ts.length?ts.map(t=>taskRow(t)).join('')+`<button class="addrow" data-act="quick">${ic('plus',16)} Añadir</button>`:empty('Bandeja vacía',''));
 };
 V.today=()=>{
   const open=myT().filter(isOpen);
@@ -437,19 +487,19 @@ V.today=()=>{
   if(S.settings.showPlan){const est=[...over,...tod].reduce((a,t)=>a+(t.estimate||30),0),cap=S.settings.capacity;h+=`<div class="plan"><span class="lbl">Carga planificada</span><span class="val">${fmtMin(est)} / ${fmtMin(cap)}</span><div class="meter"><i style="width:${Math.min(100,est/cap*100)}%" class="${est>cap?'over':''}"></i></div></div>`}
   h+=group('Vencidas',sortTasks(over),{cls:'bad'});
   h+=over.length?group('Hoy',tod):tod.map(t=>taskRow(t)).join('');
-  if(!tod.length&&!over.length)h+=empty('Nada para hoy','Buen momento para revisar tus próximas acciones.');
-  h+=`<button class="addrow" data-act="quick" data-pre="hoy ">${ic('plus',16)} Añadir tarea</button>`;
+  if(!tod.length&&!over.length)h+=empty('Nada para hoy','');
+  h+=`<button class="addrow" data-act="quick">${ic('plus',16)} Añadir tarea</button>`;
   if(doneToday.length)h+=`<details class="more" data-key="doneToday" ${U.doneToday?'open':''} style="margin-top:18px"><summary>${doneToday.length} ${doneToday.length===1?'completada':'completadas'} hoy</summary>${doneToday.map(t=>taskRow(t)).join('')}</details>`;
   return h;
 };
 V.upcoming=()=>{
-  let h=vh('Próximos','Próximos 14 días');let any=false;
+  let h=vh('Próximos','');let any=false;
   for(let i=1;i<=14;i++){
     const d=addDays(TODAY,i);const ts=sortByTime(myT().filter(t=>(t.status==='open'||t.status==='waiting')&&(t.due===d||t.deadline===d)));
     if(!ts.length)continue;any=true;const x=parse(d);
     h+=group((i===1?'Mañana · ':'')+WDC[x.getDay()]+' '+x.getDate()+' '+MES[x.getMonth()],ts);
   }
-  return h+(any?'':empty('Semana despejada','No hay nada programado en los próximos 14 días.'));
+  return h+(any?'':empty('Semana despejada',''));
 };
 V.next=()=>{
   let ts=myT().filter(isAvail);
@@ -457,32 +507,32 @@ V.next=()=>{
   if(U.maxTime)ts=ts.filter(t=>t.estimate&&t.estimate<=U.maxTime);
   const by={};ts.forEach(t=>{const c=t.contexts[0]||'Sin contexto';(by[c]=by[c]||[]).push(t)});
   const active=(U.energy!=='all'?1:0)+(U.maxTime?1:0);
-  let h=vh('Próximas acciones','Agrupadas por contexto');
+  let h=vh('Próximas acciones','');
   h+=`<details class="more" data-key="nextFilters" ${U.nextFilters||active?'open':''} style="margin:-14px 0 16px"><summary>${ic('filter',15)} Filtrar${active?' · '+active+' activo'+(active>1?'s':''):''}</summary><div class="toolbar" style="padding:6px 10px 0"><span class="tl">Energía</span><div class="chips">${[['all','Toda'],['baja','Baja'],['media','Media'],['alta','Alta']].map(([k,l])=>`<button class="fchip ${U.energy===k?'on':''}" data-act="setU" data-k="energy" data-v="${k}">${l}</button>`).join('')}</div>
   <span class="tl">Tiempo</span><div class="chips">${[[0,'Cualquiera'],[15,'≤ 15 min'],[30,'≤ 30 min'],[60,'≤ 1 h']].map(([k,l])=>`<button class="fchip ${U.maxTime==k?'on':''}" data-act="setU" data-k="maxTime" data-v="${k}">${l}</button>`).join('')}</div></div></details>`;
   const keys=Object.keys(by).sort((a,b)=>a==='Sin contexto'?1:b==='Sin contexto'?-1:by[b].length-by[a].length);
-  h+=keys.map(k=>group(k==='Sin contexto'?k:'@'+esc(k),sortTasks(by[k]))).join('')||empty('Sin acciones con estos filtros','Prueba con otro nivel de energía o de tiempo.');
+  h+=keys.map(k=>group(k==='Sin contexto'?k:'@'+esc(k),sortTasks(by[k]))).join('')||empty('Sin resultados','');
   return h;
 };
 V.waiting=()=>{
   const ts=myT().filter(t=>t.status==='waiting');const by={};
   ts.forEach(t=>{(by[t.waitingFor||'Sin asignar']=by[t.waitingFor||'Sin asignar']||[]).push(t)});
-  return vh('En espera','Delegado o pendiente de otra persona')+
-   (Object.keys(by).map(k=>group(ic('user',15)+' '+esc(k),by[k])).join('')||empty('Nada en espera','Cuando delegues algo, aparecerá aquí con la persona y los días de espera.'));
+  return vh('En espera','')+
+   (Object.keys(by).map(k=>group(ic('user',15)+' '+esc(k),by[k])).join('')||empty('Nada en espera',''));
 };
 V.someday=()=>{
   const sd=myT().filter(t=>t.status==='someday'),rf=myT().filter(t=>t.status==='reference');
-  return vh('Algún día / Quizás','Ideas aparcadas')+
+  return vh('Algún día','')+
   group('Algún día / Quizás',sd,{keep:true})+group('Material de referencia',rf,{keep:true});
 };
 V.logbook=()=>{
   const ts=myT().filter(t=>t.status==='done').sort((a,b)=>a.completed<b.completed?1:-1).slice(0,160);
   const by={};ts.forEach(t=>{(by[dayOf(t.completed)]=by[dayOf(t.completed)]||[]).push(t)});
-  return vh('Registro','Historial de tareas completadas')+Object.keys(by).map(d=>group(fmtDate(d)===WDC[parse(d).getDay()]||Math.abs(diffDays(d,TODAY))>1?fmtLong(d):fmtDate(d),by[d])).join('');
+  return vh('Registro','')+Object.keys(by).map(d=>group(fmtDate(d)===WDC[parse(d).getDay()]||Math.abs(diffDays(d,TODAY))>1?fmtLong(d):fmtDate(d),by[d])).join('');
 };
 V.context=()=>{
   const c=U.context;const ts=sortTasks(myT().filter(t=>isAvail(t)&&t.contexts.includes(c)));
-  return vh('@'+esc(c),ts.length+' acciones disponibles')+(ts.map(t=>taskRow(t)).join('')||empty('Sin acciones','No hay acciones disponibles en este contexto.'));
+  return vh('@'+esc(c),'')+(ts.map(t=>taskRow(t)).join('')||empty('Sin acciones',''));
 };
 V.filter=()=>{
   const f=S.filters.find(x=>x.id===U.filter);if(!f)return'';
@@ -504,7 +554,7 @@ V.project=()=>{
   }else{
     if(noSec.length||!secs.length)h+=group(secs.length?'Sin sección':'Tareas',sortTasks(noSec),{hideProject:true,keep:!secs.length,add:secs.length?'':' '});
     secs.forEach(s=>h+=group(esc(s),sortTasks(open.filter(t=>t.section===s)),{hideProject:true,hideSection:true,keep:true,add:s}));
-    if(!open.length&&!secs.length)h+=empty('Proyecto sin próxima acción','Todo proyecto activo necesita al menos una acción siguiente. Añade una para no perder el hilo.');
+    if(!open.length&&!secs.length)h+=empty('Sin tareas','Añade la próxima acción.');
     if(isOwner(p))h+=`<button class="addrow" data-act="addSection" style="color:var(--faint)">${ic('plus',16)} Añadir sección</button>`;
     if(done.length)h+=`<details class="more" data-key="showDone" ${U.showDone?'open':''} style="margin-top:10px"><summary>${done.length} completadas</summary>${done.sort((a,b)=>a.completed<b.completed?1:-1).slice(0,40).map(t=>taskRow(t,{hideProject:true})).join('')}</details>`;
   }
@@ -515,14 +565,14 @@ V.calendar=()=>{
   let start=mondayOf(iso(first));const cells=[];
   for(let i=0;i<42;i++){const d=addDays(start,i);cells.push(d);if(i>=34&&parse(d).getMonth()!==m-1&&i%7===6)break}
   const items=d=>myT().filter(t=>(t.status==='open'||t.status==='waiting')&&(t.due===d||t.deadline===d));
-  let h=vh('Calendario','Fechas planificadas y fechas límite');
+  let h=vh('Calendario','');
   h+=`<div class="cal-nav"><button class="iconbtn" data-act="calMove" data-v="-1" aria-label="Mes anterior">${ic('arrowL')}</button><b>${MESL[m-1]} ${y}</b><button class="iconbtn" data-act="calMove" data-v="1" aria-label="Mes siguiente">${ic('arrowR')}</button><button class="btn sm" data-act="calMove" data-v="0">Hoy</button></div>`;
   h+=`<div class="cal">${['Lun','Mar','Mié','Jue','Vie','Sáb','Dom'].map(x=>`<div class="dh">${x}</div>`).join('')}`;
   cells.forEach(d=>{const x=parse(d),its=items(d);
     h+=`<div class="d ${x.getMonth()!==m-1?'out':''} ${d===TODAY?'today':''} ${d===U.calSel?'sel':''}" data-act="calDay" data-d="${d}"><span class="num">${x.getDate()}</span>${its.slice(0,3).map(t=>{const p=proj(t.projectId);const dl=t.deadline===d&&t.due!==d;return `<div class="pill ${dl?'dl':''}" style="--c:${p?p.color:'var(--p4)'}">${dl?'⚑ ':''}${esc(t.title)}</div>`}).join('')}${its.length>3?`<span class="more">+${its.length-3} más</span>`:''}</div>`});
   h+=`</div>`;
   const sel=items(U.calSel);
-  h+=`<div style="margin-top:18px">${group(fmtLong(U.calSel),sortByTime(sel),{keep:true})}<button class="addrow" data-act="quick" data-pre="${parse(U.calSel).getDate()}/${parse(U.calSel).getMonth()+1} ">${ic('plus',16)} Añadir tarea este día</button></div>`;
+  h+=`<div style="margin-top:18px">${group(fmtLong(U.calSel),sortByTime(sel),{keep:true})}<button class="addrow" data-act="quick" data-pre="${parse(U.calSel).getDate()}/${parse(U.calSel).getMonth()+1} ">${ic('plus',16)} Añadir</button></div>`;
   return h;
 };
 V.matrix=()=>{
@@ -530,7 +580,7 @@ V.matrix=()=>{
   const urg=t=>(t.deadline&&diffDays(t.deadline,TODAY)<=2)||(t.due&&diffDays(t.due,TODAY)<=1);
   const imp=t=>t.priority<=2;
   const Q=[['q1','Hacer ahora','Importante y urgente',ts.filter(t=>imp(t)&&urg(t))],['q2','Planificar','Importante, no urgente: aquí se gana el control',ts.filter(t=>imp(t)&&!urg(t))],['q3','Delegar','Urgente, poco importante',ts.filter(t=>!imp(t)&&urg(t))],['q4','Aparcar o eliminar','Ni urgente ni importante',ts.filter(t=>!imp(t)&&!urg(t))]];
-  return vh('Matriz Eisenhower','Importancia según prioridad (P1–P2) · urgencia según fecha límite en 48 h o fecha planificada hasta mañana')+
+  return vh('Matriz Eisenhower','')+
   `<div class="matrix">${Q.map(([c,t,s,arr])=>`<div class="q ${c}"><h3>${t}<span class="cnt">${arr.length}</span></h3><p>${s}</p>${sortTasks(arr).slice(0,8).map(x=>taskRow(x)).join('')||'<p>Sin tareas.</p>'}${arr.length>8?`<p>+${arr.length-8} más</p>`:''}</div>`).join('')}</div>`;
 };
 
@@ -578,7 +628,7 @@ V.review=()=>{
   const ins=(title,arr,fn)=>!arr.length?'':`<div class="card"><h3>${title} <span class="mono" style="color:var(--faint);font-size:13px">${arr.length}</span></h3><div class="insight">${arr.length?arr.map(fn).join(''):'<p class="cap" style="margin:6px 0 0">Todo en orden.</p>'}</div></div>`;
   return vh('Revisión semanal','Última: '+(S.reviews[0]?fmtLong(S.reviews[0]):'nunca'))+
   `  <div class="g2"><div class="card"><div class="progress"><i style="width:${dn/all*100}%"></i></div>
-  ${phases.map(([t,c,items])=>`<div class="phase"><h3>${t}</h3><p class="cap">${c}</p>${items.map(([id,l,n])=>`<label class="ck ${S.reviewChecks[id]?'done':''}"><input type="checkbox" id="rv-${id}" data-rv="${id}" ${S.reviewChecks[id]?'checked':''}><span>${l}</span>${n?`<span class="n">${n}</span>`:''}</label>`).join('')}</div>`).join('')}
+  ${phases.map(([t,c,items])=>`<div class="phase"><h3>${t}</h3>${items.map(([id,l,n])=>`<label class="ck ${S.reviewChecks[id]?'done':''}"><input type="checkbox" id="rv-${id}" data-rv="${id}" ${S.reviewChecks[id]?'checked':''}><span>${l}</span>${n?`<span class="n">${n}</span>`:''}</label>`).join('')}</div>`).join('')}
   <button class="btn primary" data-act="finishReview" ${dn<all?'':''}>${ic('check',16)} Marcar revisión como completada</button></div>
   <div class="stack">
   ${ins('Proyectos sin próxima acción',noNext,p=>`<div class="row" data-act="nav" data-view="project" data-id="${p.id}"><i class="dot" style="--c:${p.color}"></i>${esc(p.name)}<span class="x">añadir acción</span></div>`)}
@@ -634,7 +684,7 @@ function lead(arr){if(!arr.length)return null;return arr.reduce((a,t)=>a+Math.ma
 function weekly(n,pred){const labels=[],vals=[];const m0=mondayOf(TODAY);for(let i=n-1;i>=0;i--){const s=addDays(m0,-7*i),e=addDays(s,6);labels.push(parse(s).getDate()+' '+MES[parse(s).getMonth()]);vals.push(pred(s,e))}return{labels,vals}}
 function delta(a,b){if(!b)return'';const p=Math.round((a-b)/b*100);return `<div class="d ${p>=0?'up':'down'}">${p>=0?'▲':'▼'} ${Math.abs(p)} % vs periodo anterior</div>`}
 V.stats=()=>{
-  let h=vh('Estadísticas','Historial y rendimiento, en global y por proyecto');
+  let h=vh('Estadísticas','');
   h+=`<div class="tabs"><button class="${U.statsTab==='global'?'on':''}" data-act="setU" data-k="statsTab" data-v="global">General</button><button class="${U.statsTab==='project'?'on':''}" data-act="setU" data-k="statsTab" data-v="project">Por proyecto</button></div>`;
   return h+(U.statsTab==='global'?statsGlobal():statsProject());
 };
@@ -657,14 +707,14 @@ function statsGlobal(){
   const counts={};myT().filter(t=>t.status==='done').forEach(t=>{const d=dayOf(t.completed);counts[d]=(counts[d]||0)+1});
   const flow=weekly(12,(s,e)=>0);const cr=flow.labels.map((_,i)=>{const s=addDays(mondayOf(TODAY),-7*(11-i)),e=addDays(s,6);return myT().filter(t=>t.created>=s&&t.created<=e).length});const cp=flow.labels.map((_,i)=>{const s=addDays(mondayOf(TODAY),-7*(11-i)),e=addDays(s,6);return doneIn(s,e).length});
   h+=`<details class="more block" data-key="statsMore" ${U.statsMore?'open':''}><summary>Ver análisis completo<span class="hint2">constancia, flujo, proyectos, horarios</span></summary><div class="kpis"><div class="kpi"><div class="l">Lead time medio</div><div class="v">${ld===null?'—':ld.toFixed(1)}<small>días</small></div><div class="d">de creación a cierre</div></div><div class="kpi"><div class="l">Trabajo en curso</div><div class="v">${wip}</div><div class="d">abiertas + en espera</div></div></div><div class="g2"><div class="card"><h3>Constancia</h3><p class="cap">Tareas completadas por día, últimas 18 semanas</p>${heat(counts)}</div>
-  <div class="card"><h3>Entrada frente a salida</h3><p class="cap">Tareas creadas y completadas por semana. Si la línea de creadas va por encima, el trabajo pendiente crece.</p>${lines([{vals:cr,color:'var(--p2)',dash:true},{vals:cp,color:'var(--accent)',area:true}],flow.labels,{every:3,h:170,aria:'Creadas frente a completadas'})}<div class="legend"><span><i style="--c:var(--p2)"></i>Creadas</span><span><i style="--c:var(--accent)"></i>Completadas</span></div></div></div>`;
+  <div class="card"><h3>Entrada frente a salida</h3><p class="cap">Creadas frente a completadas, por semana</p>${lines([{vals:cr,color:'var(--p2)',dash:true},{vals:cp,color:'var(--accent)',area:true}],flow.labels,{every:3,h:170,aria:'Creadas frente a completadas'})}<div class="legend"><span><i style="--c:var(--p2)"></i>Creadas</span><span><i style="--c:var(--accent)"></i>Completadas</span></div></div></div>`;
   const byP=S.projects.map(p=>({l:p.name,c:p.color,v:cur.filter(t=>t.projectId===p.id).length})).filter(x=>x.v).sort((a,b)=>b.v-a.v);
   const wd=[1,2,3,4,5,6,0].map(i=>cur.filter(t=>parse(dayOf(t.completed)).getDay()===i).length);
   const hrs=[];for(let hh=6;hh<=21;hh++)hrs.push(cur.filter(t=>+t.completed.slice(11,13)===hh).length);
-  h+=`<div class="g2"><div class="card"><h3>Por proyecto</h3><p class="cap">Completadas en el periodo</p>${hbars(byP)}</div>
-  <div class="card"><h3>Cuándo rindes más</h3><p class="cap">Completadas por día de la semana y por hora</p>${bars(wd,['L','M','X','J','V','S','D'],{h:120,aria:'Por día de la semana'})}${bars(hrs,hrs.map((_,i)=>String(6+i)),{h:120,every:3,color:'var(--ok)',aria:'Por hora'})}</div></div>`;
+  h+=`<div class="g2"><div class="card"><h3>Por proyecto</h3>${hbars(byP)}</div>
+  <div class="card"><h3>Cuándo rindes más</h3>${bars(wd,['L','M','X','J','V','S','D'],{h:120,aria:'Por día de la semana'})}${bars(hrs,hrs.map((_,i)=>String(6+i)),{h:120,every:3,color:'var(--ok)',aria:'Por hora'})}</div></div>`;
   const rows=S.projects.map(p=>{const pd=cur.filter(t=>t.projectId===p.id);return{p,open:S.tasks.filter(t=>t.projectId===p.id&&(isOpen(t)||t.status==='waiting')).length,done:pd.length,ot:onTime(pd),ld:lead(pd),fm:S.focusLog.filter(l=>l.projectId===p.id&&l.date>=from).reduce((a,l)=>a+l.min,0)}});
-  h+=`<div class="card"><h3>Comparativa de proyectos</h3><p class="cap">Pulsa un proyecto para ver su detalle</p><div class="tablewrap"><table class="t"><thead><tr><th>Proyecto</th><th class="n">Abiertas</th><th class="n">Completadas</th><th class="n">A tiempo</th><th class="n">Lead time</th><th class="n">Enfoque</th></tr></thead><tbody>${rows.map(r=>`<tr data-act="projStats" data-id="${r.p.id}"><td><i class="dot" style="--c:${r.p.color}"></i> ${esc(r.p.name)}</td><td class="n">${r.open}</td><td class="n">${r.done}</td><td class="n">${r.ot===null?'—':r.ot+' %'}</td><td class="n">${r.ld===null?'—':r.ld.toFixed(1)+' d'}</td><td class="n">${fmtMin(r.fm)}</td></tr>`).join('')}</tbody></table></div></div></details>`;
+  h+=`<div class="card"><h3>Comparativa de proyectos</h3><div class="tablewrap"><table class="t"><thead><tr><th>Proyecto</th><th class="n">Abiertas</th><th class="n">Completadas</th><th class="n">A tiempo</th><th class="n">Lead time</th><th class="n">Enfoque</th></tr></thead><tbody>${rows.map(r=>`<tr data-act="projStats" data-id="${r.p.id}"><td><i class="dot" style="--c:${r.p.color}"></i> ${esc(r.p.name)}</td><td class="n">${r.open}</td><td class="n">${r.done}</td><td class="n">${r.ot===null?'—':r.ot+' %'}</td><td class="n">${r.ld===null?'—':r.ld.toFixed(1)+' d'}</td><td class="n">${fmtMin(r.fm)}</td></tr>`).join('')}</tbody></table></div></div></details>`;
   return h;
 }
 function statsProject(){
@@ -680,17 +730,17 @@ function statsProject(){
   const W=weekly(10,()=>0);const ends=W.labels.map((_,i)=>addDays(addDays(mondayOf(TODAY),-7*(9-i)),6));
   const cumC=ends.map(e=>all.filter(t=>t.created<=e).length),cumD=ends.map(e=>done.filter(t=>dayOf(t.completed)<=e).length);
   const wk=weekly(10,(s,e)=>done.filter(t=>dayOf(t.completed)>=s&&dayOf(t.completed)<=e).length);
-  h+=`<div class="card" style="margin-bottom:12px"><h3>Burn-up</h3><p class="cap">Alcance acumulado frente a trabajo completado. La distancia entre líneas es lo que queda.</p>${lines([{vals:cumC,color:'var(--faint)',dash:true},{vals:cumD,color:p.color,area:true}],W.labels,{every:3,h:180,aria:'Burn-up del proyecto'})}<div class="legend"><span><i style="--c:var(--faint)"></i>Alcance</span><span><i style="--c:${p.color}"></i>Completado</span></div></div>
+  h+=`<div class="card" style="margin-bottom:12px"><h3>Burn-up</h3><p class="cap">Alcance frente a completado</p>${lines([{vals:cumC,color:'var(--faint)',dash:true},{vals:cumD,color:p.color,area:true}],W.labels,{every:3,h:180,aria:'Burn-up del proyecto'})}<div class="legend"><span><i style="--c:var(--faint)"></i>Alcance</span><span><i style="--c:${p.color}"></i>Completado</span></div></div>
   <details class="more block" data-key="statsMore" ${U.statsMore?'open':''}><summary>Ver análisis completo<span class="hint2">ritmo, prioridades, secciones, historial</span></summary><div class="g2"><div class="card"><h3>Ritmo semanal</h3><p class="cap">Tareas completadas por semana</p>${bars(wk.vals,wk.labels,{every:3,color:p.color,hl:wk.vals.length-1,h:180,aria:'Completadas por semana'})}</div></div>`;
   const prio=[1,2,3,4].map(n=>({l:'P'+n,c:`var(--p${n})`,v:open.filter(t=>t.priority===n).length}));
   const secs=(p.sections.length?p.sections:['(sin sección)']).map(s=>({l:s,c:p.color,v:done.filter(t=>(t.section||'(sin sección)')===s).length}));
-  h+=`<div class="g2"><div class="card"><h3>Abiertas por prioridad</h3><p class="cap">Pendiente actual</p>${hbars(prio)}</div><div class="card"><h3>Completadas por sección</h3><p class="cap">Histórico del proyecto</p>${hbars(secs)}</div></div>`;
+  h+=`<div class="g2"><div class="card"><h3>Abiertas por prioridad</h3>${hbars(prio)}</div><div class="card"><h3>Completadas por sección</h3><p class="cap">Histórico del proyecto</p>${hbars(secs)}</div></div>`;
   h+=`<div class="card">${group('Últimas completadas',done.sort((a,b)=>a.completed<b.completed?1:-1).slice(0,8),{hideProject:true,keep:true})}</div></details>`;
   return h;
 }
 
 /* ================== Panel de detalle ================== */
-function moreHint(t){const x=[];if(t.time)x.push(t.time);if(t.recur)x.push(t.recur.toLowerCase());if(t.reminder)x.push('aviso '+t.reminder.toLowerCase());if(t.start)x.push('diferida');if(t.status!=='open')x.push(({waiting:'en espera',someday:'algún día',reference:'referencia',done:'completada'})[t.status]);(t.contexts||[]).forEach(c=>x.push('@'+c));if(t.estimate)x.push(fmtMin(t.estimate));return esc(x.join(' · '))}
+function moreHint(t){const x=[];if(t.section)x.push(t.section);if(t.time)x.push(t.time);if(t.recur)x.push(t.recur.toLowerCase());if(t.reminder)x.push('aviso '+t.reminder.toLowerCase());if(t.start)x.push('diferida');if(t.status!=='open')x.push(({waiting:'en espera',someday:'algún día',reference:'referencia',done:'completada'})[t.status]);if(t.estimate)x.push(fmtMin(t.estimate));return esc(x.join(' · '))}
 function renderDetail(){
   const el=$('#detail'),app=$('#app');const t=task(U.sel);
   if(!t){el.hidden=true;app.classList.remove('has-detail');return}
@@ -704,23 +754,19 @@ function renderDetail(){
     <button class="iconbtn" data-act="closeDetail" aria-label="Cerrar">${ic('close')}</button></div>
    ${U.confirmDel?`<div class="confirm"><span>¿Eliminar esta tarea definitivamente?</span><button class="btn sm danger" data-act="delTask">Eliminar</button><button class="btn sm ghost" data-act="cancelDel">Cancelar</button></div>`:''}
    <div class="dp-title"><button class="check p${t.priority}" data-act="check" data-id="${t.id}" aria-label="Completar" style="${t.status==='done'?'background:var(--pc);color:#fff':''}">${ic('check',13)}</button><textarea id="d-title" data-f="title" rows="1">${esc(t.title)}</textarea></div>
-   <label class="field"><span>Proyecto</span><select class="inp" id="d-projectId" data-f="projectId"><option value="">Bandeja / sin proyecto</option>${S.areas.map(a=>`<optgroup label="${esc(a.name)}">${S.projects.filter(x=>x.area===a.id).map(x=>`<option value="${x.id}" ${x.id===t.projectId?'selected':''}>${esc(x.name)}</option>`).join('')}</optgroup>`).join('')}</select></label>
-   ${isShared(p)?`<div class="frow"><label class="field"><span>Asignada a</span><select class="inp" id="d-assigneeId" data-f="assigneeId"><option value="">Sin asignar</option>${membersOf(p.id).map(m=>`<option value="${m.userId}" ${t.assigneeId===m.userId?'selected':''}>${esc(m.userId===ME?'Yo':m.name)}</option>`).join('')}</select></label><div class="field"><span class="flabel">Creada por</span><div class="byline">${esc(personName(t.userId))}</div></div></div>`:''}
-   <div class="frow">${dateF('d-due','Fecha',t.due)}${dateF('d-deadline','Fecha límite',t.deadline)}</div>
-   <div class="field"><span class="flabel">Prioridad</span><div class="prio">${[1,2,3,4].map(n=>`<button class="${t.priority===n?'on':''}" style="--c:var(--p${n})" data-act="setPrio" data-v="${n}"><i></i>P${n}</button>`).join('')}</div></div>
-   <div class="field"><span class="flabel">Subtareas ${t.subtasks.length?`· ${t.subtasks.filter(s=>s.done).length}/${t.subtasks.length}`:''}</span><div class="subs">${t.subtasks.map((s,i)=>`<div class="sub ${s.done?'done':''}"><input type="checkbox" id="sub-c-${i}" data-sub="${i}" ${s.done?'checked':''} aria-label="Completar subtarea"><input type="text" id="sub-t-${i}" data-subt="${i}" value="${esc(s.t)}"><button data-act="delSub" data-i="${i}" aria-label="Quitar subtarea">${ic('close',14)}</button></div>`).join('')}
-    <div class="sub"><span style="width:16px;display:grid;place-items:center;color:var(--faint)">${ic('plus',14)}</span><input type="text" id="sub-new" placeholder="Añadir subtarea y pulsar Intro"></div></div></div>
-   <label class="field"><span>Notas</span><textarea class="inp" id="d-notes" data-f="notes" placeholder="Detalles, enlaces, criterios de aceptación…">${esc(t.notes)}</textarea></label>
+   <div class="dp-fields">${fieldChips(t,'task')}</div>
+   <div class="subs">${t.subtasks.map((s,i)=>`<div class="sub ${s.done?'done':''}"><input type="checkbox" id="sub-c-${i}" data-sub="${i}" ${s.done?'checked':''} aria-label="Completar subtarea"><input type="text" id="sub-t-${i}" data-subt="${i}" value="${esc(s.t)}"><button data-act="delSub" data-i="${i}" aria-label="Quitar subtarea">${ic('close',14)}</button></div>`).join('')}
+    <div class="sub"><span style="width:16px;display:grid;place-items:center;color:var(--faint)">${ic('plus',14)}</span><input type="text" id="sub-new" placeholder="Añadir subtarea"></div></div>
+   <textarea class="inp notes" id="d-notes" data-f="notes" placeholder="Notas">${esc(t.notes)}</textarea>
    <details class="more" data-key="dpMore" ${U.dpMore?'open':''}><summary>Más opciones<span class="hint2">${moreHint(t)}</span></summary><div class="more-body">
    <div class="frow"><label class="field"><span>Hora</span><input class="inp" type="time" id="d-time" data-f="time" value="${t.time||''}"></label><label class="field"><span>Recordatorio</span><select class="inp" id="d-reminder" data-f="reminder"><option value="">Sin recordatorio</option>${['A la hora','15 min antes','1 h antes','1 día antes','2 días antes'].map(r=>`<option ${t.reminder===r?'selected':''}>${r}</option>`).join('')}</select></label></div>
    <div class="frow"><label class="field"><span>Repetición</span><select class="inp" id="d-recur" data-f="recur"><option value="">No se repite</option>${['Cada día','Cada día laborable','Cada semana','Cada 2 semanas','Cada mes','Cada año',...WD.map(w=>'Cada '+w)].map(r=>`<option ${t.recur===r?'selected':''}>${r}</option>`).join('')}${t.recur&&!['Cada día','Cada día laborable','Cada semana','Cada 2 semanas','Cada mes','Cada año',...WD.map(w=>'Cada '+w)].includes(t.recur)?`<option selected>${esc(t.recur)}</option>`:''}</select></label>${dateF('d-start','Disponible desde',t.start)}</div>
    <div class="frow"><label class="field"><span>Estado</span><select class="inp" id="d-status" data-f="status">${[['open','Próxima acción'],['waiting','En espera'],['someday','Algún día / Quizás'],['reference','Referencia'],['done','Completada']].map(([k,l])=>`<option value="${k}" ${t.status===k?'selected':''}>${l}</option>`).join('')}</select></label>
    ${t.status==='waiting'?`<label class="field"><span>En espera de</span><input class="inp" id="d-waitingFor" data-f="waitingFor" value="${esc(t.waitingFor||'')}" placeholder="Persona o área"></label>`:`<label class="field"><span>Estimación</span><select class="inp" id="d-estimate" data-f="estimate"><option value="">—</option>${[5,10,15,30,45,60,90,120,180,240].map(n=>`<option value="${n}" ${t.estimate==n?'selected':''}>${fmtMin(n)}</option>`).join('')}</select></label>`}</div>
    <div class="frow"><label class="field"><span>Sección</span><select class="inp" id="d-section" data-f="section"><option value="">—</option>${(p?p.sections:[]).map(s=>`<option ${s===t.section?'selected':''}>${esc(s)}</option>`).join('')}</select></label><span></span></div>
-   <div class="field"><span class="flabel">Contextos</span><div class="ctxs">${S.contexts.map(c=>`<button class="${t.contexts.includes(c)?'on':''}" data-act="togCtx" data-v="${esc(c)}">@${esc(c)}</button>`).join('')}</div></div>
    <div class="field"><span class="flabel">Energía necesaria</span><div class="seg">${[['','—'],['baja','Baja'],['media','Media'],['alta','Alta']].map(([k,l])=>`<button class="${(t.energy||'')===k?'on':''}" data-act="setEnergy" data-v="${k}">${l}</button>`).join('')}</div></div>
    </div></details>
-   <div class="dp-foot"><span>Creada: ${fmtLong(t.created)}</span>${t.completed?`<span>Completada: ${fmtLong(dayOf(t.completed))} a las ${t.completed.slice(11,16)}</span>`:''}<span>Tiempo de enfoque: ${fmtMin(t.focusMin||0)}</span></div>
+   <div class="dp-foot"><span>${isShared(p)?'De '+esc(personName(t.userId))+' · ':''}Creada ${fmtDate(t.created).toLowerCase()}${t.completed?' · completada '+fmtDate(dayOf(t.completed)).toLowerCase():''}${t.focusMin?' · '+fmtMin(t.focusMin)+' de enfoque':''}</span><button class="linkbtn kbd-hint" data-act="shortcuts">Atajos: 1-4 · H · M · P · C · E · ?</button></div>
   </div>`;
 }
 
@@ -791,8 +837,8 @@ A.addSection=()=>{modal(`<h2>Nueva sección</h2><input class="inp" id="sec-name"
 A.saveSection=()=>{const v=$('#sec-name').value.trim();if(!v)return;proj(U.project).sections.push(v);save();closeModal();render()};
 A.close=()=>closeModal();
 A.quick=el=>openQuick(el.dataset.pre||'');
-A.quickIn=el=>{const p=proj(U.project);U.qaSection=el.dataset.section.trim()||null;openQuick('#'+norm(p.name.split(' ')[0])+' ')};
-A.qaSave=()=>qaSave();
+A.quickIn=el=>openQuick('',{section:(el.dataset.section||'').trim()||null});
+A.qaSave=()=>qaSave(false);
 A.palette=()=>openPalette();
 A.clarify=()=>{U.clar={q:myT().filter(t=>t.inbox&&isOpen(t)).map(t=>t.id),i:0,step:'q1'};renderClarify()};
 A.cl=el=>clarStep(el.dataset.v);
@@ -845,29 +891,197 @@ document.addEventListener('drop',e=>{const c=e.target.closest('[data-drop]');if(
 
 /* ================== Modales ================== */
 function modal(inner,cls=''){const m=$('#modal');m.innerHTML=`<div class="scr" data-act="close"></div><div class="mcard ${cls}" role="dialog" aria-modal="true">${inner}</div>`;m.hidden=false}
-function closeModal(){const m=$('#modal');m.hidden=true;m.innerHTML='';U.qaSection=null}
-function chipsFor(r){const o=[];const p=proj(r.projectId);
-  if(p)o.push(`<span><i class="dot" style="--c:${p.color}"></i>${esc(p.name)}</span>`);else o.push(`<span>${ic('inbox',13)} Bandeja</span>`);
-  if(r.due)o.push(`<span>${ic('calendar',13)} ${fmtDate(r.due)}${r.time?' · '+r.time:''}</span>`);else if(r.time)o.push(`<span>${ic('clock',13)} ${r.time}</span>`);
-  if(r.deadline)o.push(`<span class="dl">${ic('flag',13)} Límite ${fmtDate(r.deadline).toLowerCase()}</span>`);
-  if(r.priority<4)o.push(`<span style="color:var(--p${r.priority})">P${r.priority}</span>`);
-  r.contexts.forEach(c=>o.push(`<span>@${esc(c)}</span>`));
-  if(r.recur)o.push(`<span>${ic('repeat',13)} ${esc(r.recur)}</span>`);
-  if(r.estimate)o.push(`<span>${fmtMin(r.estimate)}</span>`);
-  return o.join('')}
-function openQuick(pre){
-  modal(`<h2>Nueva tarea</h2><input class="qa-in" id="qa-in" value="${esc(pre)}" placeholder="Revisar OEE mañana 9:00 #digitalización @ordenador !2" autocomplete="off" aria-label="Descripción de la tarea"><div class="qa-prev" id="qa-prev"></div>
-  <p class="hint">Escribe en lenguaje natural: <code>hoy</code> <code>mañana</code> <code>viernes</code> <code>15/10</code> <code>9:30</code> · <code>#proyecto</code> · <code>@contexto</code> · <code>!1</code> a <code>!4</code> prioridad · <code>plazo viernes</code> fecha límite · <code>cada lunes</code> repetición · <code>~30m</code> estimación</p>
-  <div class="row end"><button class="btn ghost" data-act="close">Cancelar</button><button class="btn primary" data-act="qaSave">Añadir tarea</button></div>`);
-  const inp=$('#qa-in');const up=()=>{$('#qa-prev').innerHTML=chipsFor(parseQuick(inp.value,true))};inp.addEventListener('input',up);inp.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();qaSave()}});up();setTimeout(()=>{inp.focus();inp.setSelectionRange(inp.value.length,inp.value.length)},30);
+function closeModal(){const m=$('#modal');m.hidden=true;m.innerHTML='';U.qaSection=null;QA=null;closePicker()}
+/* ================== Campos rápidos: proyecto, fecha, límite, prioridad, contexto ================== */
+function weekendDate(){const d=parse(TODAY);const w=d.getDay();return w===6||w===0?TODAY:nextWeekday(6)}
+function nextMonday(){return nextWeekday(1)}
+const PICK_DATES=()=>[{v:TODAY,label:'Hoy',icon:'sun',hint:WDC[parse(TODAY).getDay()].slice(0,3)},{v:addDays(TODAY,1),label:'Mañana',icon:'sunsmall',hint:WDC[parse(addDays(TODAY,1)).getDay()].slice(0,3)},{v:weekendDate(),label:'Fin de semana',icon:'calendar',hint:fmtShort(weekendDate())},{v:nextMonday(),label:'Próxima semana',icon:'upcoming',hint:fmtShort(nextMonday())},{v:'__pick',label:'Elegir fecha…',icon:'calendar'},{v:'',label:'Sin fecha',icon:'close'}];
+function visibleProjects(){return S.projects.filter(p=>p.status!=='done')}
+function chipVals(o){
+  const p=proj(o.projectId);
+  return {
+    project:p?`<i class="dot" style="--c:${p.color}"></i>${esc(p.name)}`:`${ic('inbox',14)}Bandeja`,
+    due:o.due?`${ic('calendar',14)}${fmtShort(o.due)}${o.time?' '+o.time:''}`:`${ic('calendar',14)}Fecha`,
+    deadline:o.deadline?`${ic('flag',14)}${fmtShort(o.deadline)}`:`${ic('flag',14)}Límite`,
+    priority:`<i class="pf" style="--c:var(--p${o.priority||4})">${ic('flag',14)}</i>${o.priority&&o.priority<4?'P'+o.priority:'Prioridad'}`,
+    contexts:(o.contexts&&o.contexts.length)?`${ic('at',14)}${esc(o.contexts.join(', '))}`:`${ic('at',14)}Contexto`
+  };
 }
-function qaSave(){
-  const inp=$('#qa-in');if(!inp)return;const r=parseQuick(inp.value);if(!r.title)return toast('Escribe un título para la tarea',{icon:'close'});
-  const p=proj(r.projectId);
-  const t=newTask({title:r.title,projectId:r.projectId,section:p&&U.qaSection&&p.sections.includes(U.qaSection)?U.qaSection:null,inbox:!r.projectId,priority:r.priority,due:r.due,time:r.time,deadline:r.deadline,recur:r.recur,reminder:r.time?'A la hora':null,contexts:r.contexts,estimate:r.estimate});
-  S.tasks.push(t);save();closeModal();render();
-  toast('Añadida a '+(p?esc(p.name):'la bandeja de entrada')+(t.deadline?' · aviso '+S.settings.leadDays+' días antes del límite':''),{btn:'Abrir',fn:()=>{U.sel=t.id;render()}});
+function fieldChips(o,scope){
+  const c=chipVals(o),on=k=>({project:!!o.projectId,due:!!o.due,deadline:!!o.deadline,priority:o.priority&&o.priority<4,contexts:o.contexts&&o.contexts.length})[k];
+  const p=proj(o.projectId);
+  let h=['project','due','deadline','priority','contexts'].map(k=>`<button type="button" class="fchip2 ${on(k)?'on':''} ${k==='deadline'&&o.deadline&&diffDays(o.deadline,TODAY)<=S.settings.leadDays?'hot':''}" data-act="pick" data-f="${k}" data-scope="${scope}">${c[k]}</button>`).join('');
+  if(scope==='task'&&isShared(p)){const t=o;h+=`<button type="button" class="fchip2 ${t.assigneeId?'on':''}" data-act="pick" data-f="assignee" data-scope="task">${ic('user',14)}${t.assigneeId?esc(t.assigneeId===ME?'Yo':personName(t.assigneeId)):'Asignar'}</button>`}
+  return h;
 }
+
+/* ---------- Selector flotante ---------- */
+let PK=null;
+function closePicker(){const el=$('#picker');if(el)el.remove();PK=null}
+function openPicker(cfg){
+  closePicker();PK=Object.assign({idx:0,q:''},cfg);
+  const el=document.createElement('div');el.id='picker';el.className='picker';el.setAttribute('role','listbox');document.body.appendChild(el);
+  drawPicker();
+  const r=cfg.anchor?cfg.anchor.getBoundingClientRect():null;
+  if(r&&window.innerWidth>700){const top=Math.min(r.bottom+6,window.innerHeight-el.offsetHeight-10);el.style.left=Math.max(10,Math.min(r.left,window.innerWidth-el.offsetWidth-10))+'px';el.style.top=Math.max(10,top)+'px'}
+  else el.classList.add('sheet');
+  setTimeout(()=>{const i=el.querySelector('.pk-in');if(i)i.focus()},20);
+}
+function pickerItems(){const q=norm(PK.q.trim());let it=PK.items();if(q)it=it.filter(x=>norm(x.label).includes(q));if(PK.create&&q&&!it.some(x=>norm(x.label)===q))it.push({v:'__new',label:'Crear «'+PK.q.trim()+'»',icon:'plus'});return it}
+function drawPicker(){
+  const el=$('#picker');if(!el||!PK)return;const it=pickerItems();PK.idx=Math.min(PK.idx,Math.max(0,it.length-1));
+  el.innerHTML=`<div class="pk-h">${esc(PK.title)}${PK.multi?'<button class="pk-done" data-pk="done">Listo</button>':''}</div>
+  ${PK.search?`<input class="pk-in" id="pk-in" placeholder="Buscar…" value="${esc(PK.q)}" autocomplete="off">`:'<input class="pk-in pk-hidden" id="pk-in" aria-hidden="true">'}
+  <div class="pk-list">${it.map((x,i)=>`<button class="pk-it ${i===PK.idx?'on':''} ${PK.isOn&&PK.isOn(x.v)?'sel':''}" data-pk="${i}">${x.color?`<i class="dot" style="--c:${x.color}"></i>`:x.icon?ic(x.icon,16):''}<span>${esc(x.label)}</span>${x.hint?`<small>${esc(x.hint)}</small>`:''}${PK.isOn&&PK.isOn(x.v)?ic('check',15):''}</button>`).join('')||'<p class="pk-empty">Sin resultados</p>'}</div>
+  ${PK.datePick?`<div class="pk-date"><input type="date" class="inp" id="pk-date" value="${PK.dateVal||''}"><button class="btn sm primary" data-pk="date">Usar</button></div>`:''}`;
+  const inp=el.querySelector('.pk-in');if(inp){inp.oninput=()=>{PK.q=inp.value;PK.idx=0;drawPicker();const n=$('#pk-in');n.focus();n.setSelectionRange(n.value.length,n.value.length)}}
+}
+function pickerChoose(i){
+  const it=pickerItems()[i];if(!it)return;
+  if(it.v==='__pick'){PK.datePick=true;drawPicker();setTimeout(()=>{const d=$('#pk-date');if(d){d.focus();try{d.showPicker&&d.showPicker()}catch(e){}}},30);return}
+  const v=it.v==='__new'?{create:PK.q.trim()}:it.v;
+  const keep=PK.multi;PK.onPick(v);
+  if(keep){PK.q='';drawPicker();const n=$('#pk-in');n&&n.focus()}else closePicker();
+}
+document.addEventListener('click',e=>{
+  const pk=e.target.closest('[data-pk]');
+  if(pk){e.preventDefault();e.stopPropagation();const v=pk.dataset.pk;if(v==='done')return closePicker();if(v==='date'){const d=$('#pk-date').value;if(d){PK.onPick(d);closePicker()}return}pickerChoose(+v);return}
+  if(PK&&!e.target.closest('#picker')&&!e.target.closest('[data-act="pick"]'))closePicker();
+},true);
+document.addEventListener('keydown',e=>{
+  if(!PK)return;
+  if(e.key==='Escape'){e.preventDefault();e.stopPropagation();closePicker();return}
+  if(e.target&&e.target.id==='pk-date'){if(e.key==='Enter'){e.preventDefault();const d=e.target.value;if(d){PK.onPick(d);closePicker()}}return}
+  const n=pickerItems().length;
+  if(e.key==='ArrowDown'){e.preventDefault();PK.idx=(PK.idx+1)%Math.max(1,n);drawPicker();$('#pk-in').focus()}
+  else if(e.key==='ArrowUp'){e.preventDefault();PK.idx=(PK.idx-1+n)%Math.max(1,n);drawPicker();$('#pk-in').focus()}
+  else if(e.key==='Enter'){e.preventDefault();e.stopPropagation();pickerChoose(PK.idx)}
+  else if(!PK.search&&/^[1-9]$/.test(e.key)){e.preventDefault();pickerChoose(+e.key-1)}
+},true);
+
+/* Abre el selector adecuado para un campo de una tarea ('task') o de la entrada rápida ('qa') */
+function pickField(f,scope,anchor){
+  const tgt=scope==='task'?task(U.sel):QA;if(!tgt)return;
+  const cur=scope==='qa'?qaMerged():tgt;
+  const apply=(patch)=>{
+    if(scope==='task'){Object.assign(tgt,patch);if('projectId' in patch){tgt.inbox=!patch.projectId&&tgt.status==='open';tgt.section=null;if(!isShared(proj(patch.projectId)))tgt.assigneeId=null}save();render()}
+    else{Object.assign(QA.pick,patch);qaRefresh()}
+  };
+  if(f==='project'){
+    openPicker({anchor,title:'Mover a proyecto',search:true,items:()=>[{v:'',label:'Bandeja',icon:'inbox'},...visibleProjects().map(p=>({v:p.id,label:p.name,color:p.color,hint:isOwner(p)?'':'compartido'}))],isOn:v=>(cur.projectId||'')===v,
+      onPick:v=>apply({projectId:v||null})});
+  }else if(f==='due'||f==='deadline'){
+    openPicker({anchor,title:f==='due'?'Fecha':'Fecha límite',items:PICK_DATES,datePick:false,dateVal:cur[f]||'',isOn:v=>(cur[f]||'')===v,onPick:v=>apply({[f]:v||null})});
+  }else if(f==='priority'){
+    openPicker({anchor,title:'Prioridad',items:()=>[1,2,3,4].map(n=>({v:n,label:n<4?'Prioridad '+n:'Sin prioridad',icon:'flag',color:`var(--p${n})`,hint:String(n)})),isOn:v=>(cur.priority||4)===v,onPick:v=>apply({priority:v})});
+  }else if(f==='contexts'){
+    openPicker({anchor,title:'Contextos',search:true,multi:true,create:true,items:()=>S.contexts.map(c=>({v:c,label:'@'+c})),isOn:v=>(cur.contexts||[]).includes(v),
+      onPick:v=>{let c=v&&v.create?v.create.replace(/^@/,''):v;if(v&&v.create&&!S.contexts.includes(c)){S.contexts.push(c);save()}const list=(scope==='task'?tgt.contexts:qaMerged().contexts).slice();const i=list.indexOf(c);if(i>=0)list.splice(i,1);else list.push(c);apply({contexts:list});cur.contexts=list}});
+  }else if(f==='assignee'&&scope==='task'){
+    const p=proj(tgt.projectId);if(!isShared(p))return;
+    openPicker({anchor,title:'Asignar a',items:()=>[{v:'',label:'Sin asignar',icon:'close'},...membersOf(p.id).map(m=>({v:m.userId,label:m.userId===ME?'Yo':m.name,icon:'user'}))],isOn:v=>(tgt.assigneeId||'')===v,onPick:v=>apply({assigneeId:v||null})});
+  }
+}
+A.pick=el=>pickField(el.dataset.f,el.dataset.scope,el);
+
+/* ================== Entrada rápida contextual ================== */
+let QA=null;
+function quickDefaults(extra){
+  const d={projectId:null,section:null,due:null,deadline:null,priority:4,contexts:[],status:'open'};
+  if(U.view==='project'&&proj(U.project)){d.projectId=U.project}
+  if(U.view==='today')d.due=TODAY;
+  if(U.view==='calendar')d.due=U.calSel;
+  if(U.view==='context'&&U.context)d.contexts=[U.context];
+  if(U.view==='someday')d.status='someday';
+  if(U.view==='waiting')d.status='waiting';
+  return Object.assign(d,extra||{});
+}
+function qaMerged(){
+  const inp=$('#qa-in');const r=parseQuick(inp?inp.value:'',true);const d=QA.def,pk=QA.pick;
+  const m={projectId:d.projectId,due:d.due,deadline:d.deadline,priority:d.priority,contexts:d.contexts.slice(),time:null,recur:null,estimate:null,title:r.title};
+  if(r.projectId)m.projectId=r.projectId;if(r.due)m.due=r.due;if(r.deadline)m.deadline=r.deadline;if(r.priority<4)m.priority=r.priority;
+  if(r.contexts.length)m.contexts=[...new Set([...m.contexts,...r.contexts])];m.time=r.time;m.recur=r.recur;m.estimate=r.estimate;
+  for(const k in pk)m[k]=pk[k];
+  return m;
+}
+function qaRefresh(){const f=$('#qa-fields');if(f&&QA)f.innerHTML=fieldChips(qaMerged(),'qa')}
+function openQuick(pre,extra){
+  QA={def:quickDefaults(extra),pick:{}};
+  const where=QA.def.projectId?proj(QA.def.projectId).name:QA.def.status==='someday'?'Algún día':'';
+  modal(`<div class="qa">
+    <input class="qa-in" id="qa-in" value="${esc(pre||'')}" placeholder="Nueva tarea${where?' en '+esc(where):''}" autocomplete="off" aria-label="Nueva tarea">
+    <div class="qa-ac" id="qa-ac" hidden></div>
+    <div class="qa-fields" id="qa-fields"></div>
+    <div class="qa-foot"><span class="qa-tip">Intro añade · Mayús+Intro añade otra · <kbd>#</kbd> proyecto <kbd>@</kbd> contexto <kbd>!</kbd> prioridad</span><button class="btn ghost sm" data-act="close">Cancelar</button><button class="btn primary sm" data-act="qaSave">Añadir</button></div>
+  </div>`,'qa-card');
+  const inp=$('#qa-in');
+  inp.addEventListener('input',()=>{qaRefresh();qaAutocomplete()});
+  inp.addEventListener('keydown',e=>{
+    const ac=$('#qa-ac');
+    if(!ac.hidden&&['ArrowDown','ArrowUp','Tab','Enter'].includes(e.key)){
+      const its=[...ac.querySelectorAll('.pk-it')];let i=its.findIndex(x=>x.classList.contains('on'));
+      if(e.key==='ArrowDown'||e.key==='ArrowUp'){e.preventDefault();its.forEach(x=>x.classList.remove('on'));i=(i+(e.key==='ArrowDown'?1:-1)+its.length)%its.length;its[i].classList.add('on');return}
+      if(i>=0){e.preventDefault();its[i].click();return}
+    }
+    if(e.key==='Escape'&&!ac.hidden){e.preventDefault();e.stopPropagation();ac.hidden=true;return}
+    if(e.key==='Enter'){e.preventDefault();qaSave(e.shiftKey)}
+  });
+  qaRefresh();setTimeout(()=>{inp.focus();inp.setSelectionRange(inp.value.length,inp.value.length)},30);
+}
+/* Sugerencias al escribir #, @ o ! */
+function qaAutocomplete(){
+  const inp=$('#qa-in'),ac=$('#qa-ac');const pos=inp.selectionStart||inp.value.length;const before=inp.value.slice(0,pos);
+  const m=before.match(/(^|\s)([#@!])([^\s#@!]*)$/);if(!m){ac.hidden=true;return}
+  const sym=m[2],q=norm(m[3]);let items=[];
+  if(sym==='#')items=[{v:'',label:'Bandeja',icon:'inbox'},...visibleProjects().map(p=>({v:p.id,label:p.name,color:p.color}))].filter(x=>!q||norm(x.label).includes(q));
+  if(sym==='@')items=S.contexts.map(c=>({v:c,label:'@'+c})).filter(x=>!q||norm(x.label).includes(q));
+  if(sym==='!')items=[1,2,3,4].map(n=>({v:n,label:n<4?'Prioridad '+n:'Sin prioridad',color:`var(--p${n})`})).filter(x=>!q||String(x.v).startsWith(q));
+  if(sym==='@'&&m[3]&&!items.some(x=>norm(x.label)==='@'+q))items.push({v:{create:m[3]},label:'Crear @'+m[3],icon:'plus'});
+  if(!items.length){ac.hidden=true;return}
+  ac.hidden=false;ac.innerHTML=items.slice(0,8).map((x,i)=>`<button type="button" class="pk-it ${i===0?'on':''}" data-qa="${i}">${x.color?`<i class="dot" style="--c:${x.color}"></i>`:x.icon?ic(x.icon,16):''}<span>${esc(x.label)}</span></button>`).join('');
+  ac.querySelectorAll('[data-qa]').forEach(b=>b.onclick=ev=>{ev.preventDefault();const x=items[+b.dataset.qa];
+    const start=pos-m[0].length+m[1].length;inp.value=(inp.value.slice(0,start)+inp.value.slice(pos)).replace(/\s{2,}/g,' ');
+    if(sym==='#')QA.pick.projectId=x.v||null;
+    if(sym==='!')QA.pick.priority=x.v;
+    if(sym==='@'){let c=x.v&&x.v.create?x.v.create:x.v;if(!S.contexts.includes(c)){S.contexts.push(c);save()}const list=qaMerged().contexts;if(!list.includes(c))list.push(c);QA.pick.contexts=list}
+    ac.hidden=true;qaRefresh();inp.focus();inp.setSelectionRange(start,start)});
+}
+function qaSave(again){
+  const inp=$('#qa-in');if(!inp||!QA)return;const m=qaMerged();
+  if(!m.title)return toast('Escribe qué hay que hacer',{icon:'close'});
+  const p=proj(m.projectId);
+  const t=newTask({title:m.title,projectId:m.projectId,section:p&&QA.def.section&&p.sections.includes(QA.def.section)?QA.def.section:null,
+    inbox:!m.projectId&&QA.def.status==='open',status:QA.def.status,waitingSince:QA.def.status==='waiting'?TODAY:null,priority:m.priority||4,due:m.due,time:m.time,deadline:m.deadline,recur:m.recur,reminder:m.time?'A la hora':null,contexts:m.contexts,estimate:m.estimate});
+  S.tasks.push(t);save();render();
+  if(again){inp.value='';QA.pick={};qaRefresh();inp.focus();toast('Añadida: '+esc(t.title),{ms:1800});return}
+  closeModal();
+  toast('Añadida'+(p?' a '+esc(p.name):m.projectId===null&&t.inbox?' a la Bandeja':''),{btn:'Abrir',fn:()=>{U.sel=t.id;render()}});
+}
+
+/* ================== Atajos de teclado ================== */
+const SHORTCUTS=[['Q','Nueva tarea'],['/','Buscar'],['J  K','Bajar · subir por la lista'],['1 – 4','Prioridad'],['H','Fecha: hoy'],['M','Fecha: mañana'],['D','Elegir fecha'],['L','Fecha límite'],['P','Mover a proyecto'],['C','Contextos'],['A','Asignar (compartidos)'],['E','Completar'],['Supr','Eliminar'],['Esc','Cerrar'],['?','Ver atajos']];
+function openShortcuts(){modal(`<h2>Atajos de teclado</h2><div class="kbd-grid">${SHORTCUTS.map(([k,l])=>`<kbd>${k}</kbd><span>${l}</span>`).join('')}</div><p class="cap" style="margin-top:12px">En la entrada rápida: <kbd>#</kbd> proyecto, <kbd>@</kbd> contexto, <kbd>!</kbd> prioridad, y fechas como «mañana» o «viernes».</p><div class="row end"><button class="btn primary" data-act="close">Entendido</button></div>`)}
+A.shortcuts=()=>openShortcuts();
+function moveSel(dir){
+  const rows=[...document.querySelectorAll('#view .task[data-id]')];if(!rows.length)return;
+  let i=rows.findIndex(r=>r.dataset.id===U.sel);i=i<0?(dir>0?0:rows.length-1):Math.max(0,Math.min(rows.length-1,i+dir));
+  U.sel=rows[i].dataset.id;U.confirmDel=false;render();const r=document.querySelector(`#view .task[data-id="${U.sel}"]`);r&&r.scrollIntoView({block:'nearest'});
+}
+document.addEventListener('keydown',e=>{
+  if(!S||PK||e.ctrlKey||e.metaKey||e.altKey)return;
+  const a=document.activeElement;if(/INPUT|TEXTAREA|SELECT/.test(a.tagName)||!$('#modal').hidden)return;
+  const k=e.key;
+  if(k==='?'){e.preventDefault();openShortcuts();return}
+  if(k==='j'||k==='ArrowDown'){if(k==='j'||U.sel){e.preventDefault();moveSel(1)}return}
+  if(k==='k'||k==='ArrowUp'){if(k==='k'||U.sel){e.preventDefault();moveSel(-1)}return}
+  const t=task(U.sel);if(!t)return;
+  const chip=f=>document.querySelector(`#detail [data-act="pick"][data-f="${f}"]`);
+  const set=patch=>{Object.assign(t,patch);save();render()};
+  if(/^[1-4]$/.test(k)){e.preventDefault();set({priority:+k});toast('Prioridad '+(k==='4'?'quitada':k),{ms:1200});return}
+  const map={h:()=>{set({due:TODAY});toast('Para hoy',{ms:1200})},m:()=>{set({due:addDays(TODAY,1)});toast('Para mañana',{ms:1200})},d:()=>pickField('due','task',chip('due')),l:()=>pickField('deadline','task',chip('deadline')),p:()=>pickField('project','task',chip('project')),c:()=>pickField('contexts','task',chip('contexts')),'@':()=>pickField('contexts','task',chip('contexts')),a:()=>pickField('assignee','task',chip('assignee')),e:()=>{complete(t);render()},Delete:()=>A.askDel(),Backspace:()=>A.askDel()};
+  if(map[k]){e.preventDefault();map[k]()}
+});
+
 /* Paleta de comandos */
 function openPalette(){
   modal(`<input class="pal-in" id="pal-in" placeholder="Buscar tareas, proyectos o vistas…" autocomplete="off" aria-label="Buscar"><div class="pal-list" id="pal-list"></div>`);
@@ -975,89 +1189,62 @@ document.addEventListener('keydown',e=>{
 
 /* ---------- Ajustes ---------- */
 V.settings=()=>{
-  const s=S.settings;const perm=('Notification' in window)?({granted:'concedido',denied:'denegado',default:'sin decidir'})[Notification.permission]:'no disponible en este navegador';
+  const s=S.settings;
   const sw=(k)=>`<button class="switch ${s[k]?'on':''}" data-act="toggleSet" data-k="${k}" role="switch" aria-checked="${!!s[k]}" aria-label="${k}"></button>`;
   const base=(CFG.SUPABASE_URL||'').replace(/\/+$/,'');
   let code='';try{code=localStorage.getItem('summit-sc-'+ME)||''}catch(e){}
   let ck='';try{ck=localStorage.getItem('summit-ck-'+ME)||''}catch(e){}
-  const copyRow=(l,v,id,hint)=>`<div class="set"><div class="l" style="min-width:0"><b>${l}</b><span class="mono" style="overflow-wrap:anywhere" id="${id}">${esc(v)}</span>${hint?`<span>${hint}</span>`:''}</div><button class="btn sm" data-act="copyTxt" data-src="${id}">${ic('copy',15)} Copiar</button></div>`;
-  return vh('Ajustes')+
-  `<div class="stack">
-  <div class="card"><h3>${ic('user',17)} Tu cuenta</h3>
-    <div class="set"><div class="l"><b>Nombre</b><span>Es el que ven las personas de tus proyectos compartidos</span></div><input class="inp" id="set-name" value="${esc(S.me.name)}" style="width:min(220px,100%)"></div>
-    <div class="set"><div class="l"><b>Correo</b><span>${esc(MEMAIL)}</span></div><button class="btn sm" data-act="logout">Cerrar sesión</button></div></div>
-  <div class="card"><h3>${ic('list',17)} Vista</h3>
-    <div class="set" style="grid-template-columns:1fr"><div class="l"><b>Cómo leer una tarea</b><span>La información va codificada con color y forma para no llenar la pantalla de texto</span></div>
-    <div class="leg"><span><button class="check p1" tabindex="-1" aria-hidden="true"></button>Color del círculo = prioridad</span><span><span class="bdg today">Hoy</span><span class="bdg late">Ayer</span>Fecha (rojo si se pasó)</span><span><span class="bdg dl hot">${ic('flag',11)}2 d</span><span class="bdg dl far">${ic('flag',11)}8 d</span>Días hasta la fecha límite</span><span><span class="av-s">C</span>Asignada o en espera de alguien</span><span><span style="color:var(--faint);display:inline-flex;gap:4px">${ic('repeat',13)}${miniRing(1,3)}${ic('note',13)}</span>Se repite · subtareas · notas</span><span><i class="dot" style="--c:#5F7F6A"></i>Color del proyecto</span><span><b>Negrita</b> = prioridad 1</span></div></div>
-    <div class="set"><div class="l"><b>Mostrar todos los detalles en las listas</b><span>Contextos, estimación, energía y subtareas bajo cada tarea</span></div>${sw('detailed')}</div>
-    <div class="set"><div class="l"><b>Mostrar la carga del día en Hoy</b><span>Barra de tiempo planificado frente a capacidad</span></div>${sw('showPlan')}</div>
-    <div class="set"><div class="l"><b>Tema</b><span>Sigue al sistema o fija claro u oscuro</span></div><div class="seg">${[['system','Sistema'],['light','Claro'],['dark','Oscuro']].map(([k,l])=>`<button class="${s.theme===k?'on':''}" data-act="setTheme" data-v="${k}">${l}</button>`).join('')}</div></div></div>
-  <div class="card"><h3>${ic('bell',17)} Avisos y fechas límite</h3>
-    <div class="set"><div class="l"><b>Avisar antes de la fecha límite</b><span>Dentro de la app y en el resumen diario del atajo</span></div><select class="inp" id="set-lead" style="width:auto">${[1,2,3,5,7].map(n=>`<option value="${n}" ${s.leadDays==n?'selected':''}>${n} ${n===1?'día':'días'} antes</option>`).join('')}</select></div>
-    <div class="set"><div class="l"><b>Avisar de tareas vencidas</b><span>Recordatorio hasta que la cierres o cambies la fecha</span></div>${sw('notifyOverdue')}</div>
-    <div class="set"><div class="l"><b>Día de la revisión semanal</b><span>Se marca en la barra lateral ese día</span></div><select class="inp" id="set-rev" style="width:auto">${WDC.map((w,i)=>`<option value="${i}" ${s.reviewDay==i?'selected':''}>${w}</option>`).join('')}</select></div>
-    <div class="set"><div class="l"><b>Notificaciones con la app abierta</b><span>Permiso: ${perm}. Para recibir avisos con la app cerrada usa el resumen diario del atajo.</span></div><button class="btn sm" data-act="askPerm">Activar</button></div></div>
-  <div class="card"><h3>${ic('sun',17)} Planificación</h3>
-    <div class="set"><div class="l"><b>Capacidad diaria</b><span>Se usa para la barra de carga de Hoy</span></div><select class="inp" id="set-cap" style="width:auto">${[240,360,420,480,540,600].map(n=>`<option value="${n}" ${s.capacity==n?'selected':''}>${fmtMin(n)}</option>`).join('')}</select></div>
-    <div class="set"><div class="l"><b>Regla de los 2 minutos</b><span>Pregunta al procesar la bandeja</span></div>${sw('twoMinute')}</div></div>
-  <div class="card"><h3>${ic('folder',17)} Áreas y contextos</h3>
-    <p class="cap" style="margin:4px 0 8px">Las áreas agrupan tus proyectos. Los contextos indican dónde o con qué puedes hacer una tarea.</p>
-    <div class="flabel" style="margin-top:6px">Áreas</div>
-    <div class="editlist">${S.areas.map(a=>`<div class="erow"><input class="inp" id="area-${a.id}" data-area="${a.id}" value="${esc(a.name)}" aria-label="Nombre del área">${S.projects.some(p=>p.area===a.id)?'':`<button class="iconbtn" data-act="delArea" data-id="${a.id}" aria-label="Eliminar área">${ic('trash',16)}</button>`}</div>`).join('')}
-      <div class="erow"><input class="inp" id="area-new" placeholder="Nueva área y pulsa Intro"></div></div>
-    <div class="flabel" style="margin-top:12px">Contextos</div>
-    <div class="ctxs" style="margin-top:6px">${S.contexts.map(c=>`<button class="on" data-act="delCtx" data-v="${esc(c)}" title="Quitar">@${esc(c)} ×</button>`).join('')}</div>
-    <div class="erow" style="margin-top:8px"><input class="inp" id="ctx-new" placeholder="Nuevo contexto y pulsa Intro"></div></div>
-  <div class="card"><h3>${ic('bolt',17)} Atajos de iPhone</h3>
-    <p class="cap" style="margin:4px 0 10px">Captura tareas sin abrir Summit (Botón de Acción, Siri, widget, hoja de compartir) y recibe cada mañana un aviso con lo de hoy y las fechas límite.</p>
-    ${copyRow('URL para capturar',base+'/rest/v1/rpc/summit_capturar_tarea','sc-url')}
-    ${copyRow('URL del resumen diario',base+'/rest/v1/rpc/summit_resumen','sc-url2')}
-    ${copyRow('Clave (apikey)',CFG.SUPABASE_ANON_KEY||'','sc-key','Va en el encabezado apikey')}
-    ${code?copyRow('Tu código personal',code,'sc-code','Solo se muestra en este dispositivo. Guárdalo en el atajo.'):''}
-    <div class="set"><div class="l"><b>Código personal</b><span>${S.hasShortcut?'Activo. Si pierdes el móvil, revócalo y genera otro.':'Aún no tienes código. Genéralo para configurar los atajos.'}</span></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn sm ${S.hasShortcut?'':'primary'}" data-act="scNew">${S.hasShortcut?'Generar nuevo':'Generar código'}</button>${S.hasShortcut?'<button class="btn sm danger" data-act="scRevoke">Revocar</button>':''}</div></div>
-    <details class="more" data-key="scSteps" ${U.scSteps?'open':''} style="margin-top:6px"><summary>Atajo 1 · Capturar en Summit</summary>
-    <ol class="steps">
-      <li>Abre <b>Atajos</b>, toca <b>+</b> y llámalo <b>Capturar en Summit</b>.</li>
-      <li>Añade <b>Solicitar entrada</b>: tipo Texto, pregunta «¿Qué tienes en mente?» y, como respuesta predeterminada, la variable <b>Entrada del atajo</b>.</li>
-      <li>Añade <b>Obtener contenido de URL</b> con la URL para capturar. Despliega las opciones: método <b>POST</b>; encabezados <code>apikey</code> (la clave) y <code>Content-Type</code> = <code>application/json</code>; cuerpo <b>JSON</b> con <code>p_codigo</code> (tu código) y <code>p_texto</code> (variable <b>Entrada proporcionada</b>).</li>
-      <li>Añade <b>Mostrar notificación</b> con la variable <b>Contenido de la URL</b>.</li>
-      <li>En ⓘ, activa <b>Mostrar en hoja de compartir</b>.</li>
-      <li>Asígnalo en <b>Ajustes → Botón de Acción → Atajo</b>, o añádelo como widget o al Centro de control. Por voz: «Oye Siri, capturar en Summit».</li>
-    </ol></details>
-    <details class="more" data-key="scSteps2" ${U.scSteps2?'open':''}><summary>Atajo 2 · Resumen diario automático</summary>
-    <ol class="steps">
-      <li>En <b>Atajos → Automatización</b>, toca <b>+</b> y elige <b>Hora del día</b>. Pon la hora (por ejemplo, 07:00), <b>Diariamente</b> y <b>Ejecutar inmediatamente</b>.</li>
-      <li>Crea un atajo nuevo con <b>Obtener contenido de URL</b>: la URL del resumen, método <b>POST</b>, los mismos encabezados y un cuerpo <b>JSON</b> con <code>p_codigo</code> (tu código).</li>
-      <li>Añade <b>Mostrar notificación</b> con la variable <b>Contenido de la URL</b>.</li>
-      <li>Cada mañana recibirás, por ejemplo: «Summit · Hoy: 3 tareas · Vencidas: 1», con las fechas límite de los próximos días.</li>
-    </ol></details></div>
-  <div class="card"><h3>${ic('sparkle',17)} Conector de Claude</h3>
-    <p class="cap" style="margin:4px 0 10px">Conecta Summit con Claude para preguntarle por tus tareas, proyectos y estadísticas, o pedirle que cree y organice cosas por ti. Claude solo ve lo mismo que tú ves en Summit.</p>
-    ${ck?copyRow('URL del conector',base+'/functions/v1/summit-mcp?key='+ck,'ck-url','Solo se muestra en este dispositivo. Pégala en Claude y no la compartas: da acceso a tu Summit.'):''}
-    <div class="set"><div class="l"><b>Clave del conector</b><span>${S.hasClaude?('Activa'+(S.claudeUsed?' · último uso: '+fmtDate(iso(new Date(S.claudeUsed))).toLowerCase():' · aún sin usar')+'. Si la revocas, Claude pierde el acceso al momento.'):'Genera la clave para obtener la URL del conector.'}</span></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn sm ${S.hasClaude?'':'primary'}" data-act="ckNew">${S.hasClaude?'Generar nueva':'Generar clave'}</button>${S.hasClaude?'<button class="btn sm danger" data-act="ckRevoke">Revocar</button>':''}</div></div>
-    <details class="more" data-key="ckSteps" ${U.ckSteps?'open':''} style="margin-top:6px"><summary>Cómo añadirlo en Claude (1 minuto)</summary>
-    <ol class="steps">
-      <li>Pulsa <b>Generar clave</b> y copia la <b>URL del conector</b>.</li>
-      <li>En Claude (web o app de escritorio), ve a <b>Personalizar → Conectores</b>, pulsa <b>+</b> y elige <b>Añadir conector personalizado</b>.</li>
-      <li>Nombre: <b>Summit</b>. URL: pega la que has copiado. Autenticación: <b>sin inicio de sesión</b>. Guarda.</li>
-      <li>En una conversación, activa el conector Summit y pregunta, por ejemplo: «¿Qué tengo esta semana?» o «Crea un proyecto para el viaje a Valladolid con 5 tareas y compártelo».</li>
-    </ol>
-    <p class="cap" style="margin:0 0 6px">Una vez añadido, también funciona en la app de Claude del iPhone. El plan gratuito de Claude permite un conector personalizado.</p></details></div>
-  <div class="card"><h3>${ic('copy',17)} Datos</h3>
-    <div class="set"><div class="l"><b>Copia de seguridad</b><span>Descarga todos tus datos en un archivo JSON</span></div><button class="btn sm" data-act="exportJson">Descargar</button></div>
-    <div class="set"><div class="l"><b>Estado de sincronización</b><span>${QUEUE.length?QUEUE.length+' cambios pendientes de enviar':'Todo guardado en la nube'}</span></div><button class="btn sm" data-act="syncNow">Sincronizar</button></div></div>
-  <p class="cap" style="text-align:center;margin:8px 0 0">Summit ${APP_VERSION}</p></div>`;
+  const row=(l,ctrl)=>`<div class="set"><div class="l"><b>${l}</b></div>${ctrl}</div>`;
+  const copyRow=(l,v,id)=>`<div class="set"><div class="l" style="min-width:0"><b>${l}</b><span class="mono" style="overflow-wrap:anywhere" id="${id}">${esc(v)}</span></div><button class="btn sm" data-act="copyTxt" data-src="${id}">${ic('copy',15)} Copiar</button></div>`;
+  const sel=(id,opts,cur)=>`<select class="inp" id="${id}" style="width:auto">${opts.map(([v,l])=>`<option value="${v}" ${cur==v?'selected':''}>${l}</option>`).join('')}</select>`;
+  const grp=(key,icon,title,val,body)=>`<details class="sgroup" data-key="${key}" ${U[key]?'open':''}><summary>${ic(icon,18)}<b>${title}</b>${val?`<span class="sv">${val}</span>`:''}</summary><div class="sbody">${body}</div></details>`;
+  return vh('Ajustes')+`<div class="sgroups">
+  ${grp('sgAcc','user','Cuenta',esc(S.me.name),row('Nombre',`<input class="inp" id="set-name" value="${esc(S.me.name)}" style="width:min(200px,100%)">`)+row(esc(MEMAIL),`<button class="btn sm" data-act="logout">Cerrar sesión</button>`))}
+  ${grp('sgView','sun','Apariencia',({system:'Automático',light:'Claro',dark:'Oscuro'})[s.theme],
+    row('Tema',`<div class="seg">${[['system','Auto'],['light','Claro'],['dark','Oscuro']].map(([k,l])=>`<button class="${s.theme===k?'on':''}" data-act="setTheme" data-v="${k}">${l}</button>`).join('')}</div>`)+
+    row('Más detalles en las listas',sw('detailed'))+row('Carga del día en Hoy',sw('showPlan'))+
+    `<details class="more"><summary>Cómo leer una tarea</summary><div class="leg"><span><button class="check p1" tabindex="-1" aria-hidden="true"></button>Prioridad</span><span><span class="bdg today">Hoy</span><span class="bdg late">Ayer</span>Fecha</span><span><span class="bdg dl hot">${ic('flag',11)}2 d</span>Días a la fecha límite</span><span><span class="av-s">C</span>Persona</span><span><span style="color:var(--faint);display:inline-flex;gap:4px">${ic('repeat',13)}${miniRing(1,3)}${ic('note',13)}</span>Repite · subtareas · notas</span></div></details>`)}
+  ${grp('sgNot','bell','Avisos',s.leadDays+(s.leadDays==1?' día antes':' días antes'),
+    row('Avisar antes de la fecha límite',sel('set-lead',[1,2,3,5,7].map(n=>[n,n+(n===1?' día':' días')]),s.leadDays))+
+    row('Avisar de vencidas',sw('notifyOverdue'))+
+    row('Día de revisión semanal',sel('set-rev',WDC.map((w,i)=>[i,w]),s.reviewDay))+
+    row('Notificaciones',`<button class="btn sm" data-act="askPerm">Activar</button>`))}
+  ${grp('sgPlan','target','Planificación','',row('Capacidad diaria',sel('set-cap',[240,360,420,480,540,600].map(n=>[n,fmtMin(n)]),s.capacity))+row('Regla de los 2 minutos',sw('twoMinute')))}
+  ${grp('sgAreas','folder','Áreas y contextos',S.areas.length+' áreas · '+S.contexts.length+' contextos',
+    `<div class="flabel">Áreas</div><div class="editlist">${S.areas.map(a=>`<div class="erow"><input class="inp" id="area-${a.id}" data-area="${a.id}" value="${esc(a.name)}" aria-label="Nombre del área">${S.projects.some(p=>p.area===a.id)?'':`<button class="iconbtn" data-act="delArea" data-id="${a.id}" aria-label="Eliminar área">${ic('trash',16)}</button>`}</div>`).join('')}<div class="erow"><input class="inp" id="area-new" placeholder="+ Nueva área"></div></div>
+    <div class="flabel" style="margin-top:12px">Contextos</div><div class="ctxs" style="margin-top:6px">${S.contexts.map(c=>`<button class="on" data-act="delCtx" data-v="${esc(c)}" title="Quitar">@${esc(c)} ×</button>`).join('')}</div><div class="erow" style="margin-top:8px"><input class="inp" id="ctx-new" placeholder="+ Nuevo contexto"></div>`)}
+  ${grp('sgSc','bolt','Atajos de iPhone',S.hasShortcut?'Activo':'',
+    `<div class="set"><div class="l"><b>Código personal</b></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn sm ${S.hasShortcut?'':'primary'}" data-act="scNew">${S.hasShortcut?'Nuevo código':'Generar'}</button>${S.hasShortcut?'<button class="btn sm danger" data-act="scRevoke">Revocar</button>':''}</div></div>
+    ${code?copyRow('Tu código',code,'sc-code'):''}${copyRow('URL para capturar',base+'/rest/v1/rpc/summit_capturar_tarea','sc-url')}${copyRow('URL del resumen',base+'/rest/v1/rpc/summit_resumen','sc-url2')}${copyRow('Clave (apikey)',CFG.SUPABASE_ANON_KEY||'','sc-key')}
+    <details class="more" data-key="scSteps" ${U.scSteps?'open':''}><summary>Crear «Capturar en Summit»</summary><ol class="steps">
+      <li><b>Atajos → +</b>. Añade <b>Solicitar entrada</b> (Texto).</li>
+      <li>Añade <b>Obtener contenido de URL</b>: URL para capturar · <b>POST</b> · encabezados <code>apikey</code> y <code>Content-Type: application/json</code> · cuerpo JSON <code>p_codigo</code> y <code>p_texto</code> (Entrada proporcionada).</li>
+      <li>Añade <b>Mostrar notificación</b> con el resultado.</li>
+      <li>Asígnalo al <b>Botón de Acción</b>, a un widget o a Siri.</li></ol></details>
+    <details class="more" data-key="scSteps2" ${U.scSteps2?'open':''}><summary>Crear el resumen de cada mañana</summary><ol class="steps">
+      <li><b>Atajos → Automatización → Hora del día</b> (07:00, diariamente, ejecutar inmediatamente).</li>
+      <li><b>Obtener contenido de URL</b>: URL del resumen · POST · mismos encabezados · JSON con <code>p_codigo</code>.</li>
+      <li><b>Mostrar notificación</b> con el resultado.</li></ol></details>`)}
+  ${grp('sgCl','sparkle','Claude',S.hasClaude?'Conectado':'',
+    `<div class="set"><div class="l"><b>Clave del conector</b>${S.hasClaude&&S.claudeUsed?`<span>Último uso ${fmtDate(iso(new Date(S.claudeUsed))).toLowerCase()}</span>`:''}</div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn sm ${S.hasClaude?'':'primary'}" data-act="ckNew">${S.hasClaude?'Nueva clave':'Generar'}</button>${S.hasClaude?'<button class="btn sm danger" data-act="ckRevoke">Revocar</button>':''}</div></div>
+    ${ck?copyRow('URL del conector (privada)',base+'/functions/v1/summit-mcp?key='+ck,'ck-url'):''}
+    <details class="more" data-key="ckSteps" ${U.ckSteps?'open':''}><summary>Añadirlo en Claude</summary><ol class="steps">
+      <li>Copia la URL del conector.</li>
+      <li>Claude → <b>Personalizar → Conectores → + → Añadir conector personalizado</b>.</li>
+      <li>Nombre <b>Summit</b>, pega la URL, <b>sin inicio de sesión</b>.</li></ol></details>`)}
+  ${grp('sgData','copy','Datos',QUEUE.length?QUEUE.length+' sin enviar':'Sincronizado',
+    row(QUEUE.length?QUEUE.length+' cambios pendientes':'Todo sincronizado',`<button class="btn sm" data-act="syncNow">Sincronizar</button>`)+row('Copia de seguridad (JSON)',`<button class="btn sm" data-act="exportJson">Descargar</button>`)+row('Atajos de teclado',`<button class="btn sm" data-act="shortcuts">Ver</button>`))}
+  </div><p class="cap" style="text-align:center;margin:14px 0 0">Summit ${APP_VERSION}</p>`;
 };
-
 /* ---------- Proyectos compartidos ---------- */
 function openShareModal(pid){
   const p=proj(pid);if(!p)return;const ms=membersOf(p.id);const own=isOwner(p);
   const list=`<div class="members">${ms.map(m=>`<div class="mrow"><span class="av-s">${esc(initial(m.name))}</span><span class="mn">${esc(m.name||'Miembro')}${m.userId===ME?' (tú)':''}</span><span class="mr">${m.role==='owner'?'Propietario':'Miembro'}</span>${own&&m.userId!==ME?`<button class="iconbtn" data-act="kick" data-p="${p.id}" data-u="${m.userId}" aria-label="Quitar a ${esc(m.name)}">${ic('close',15)}</button>`:''}</div>`).join('')}</div>`;
   if(own){
     modal(`<h2>Compartir «${esc(p.name)}»</h2>
-    <p class="cap">Las personas que se unan podrán ver todas las tareas de este proyecto, añadir las suyas, completarlas y asignarlas. Tus demás proyectos siguen siendo privados.</p>
+    <p class="cap">Quien se una verá y podrá añadir tareas a este proyecto. El resto de tu Summit sigue siendo privado.</p>
     ${p.shareCode?`<div class="codebox"><span class="mono" id="share-code">${esc(p.shareCode)}</span><button class="btn sm" data-act="copyTxt" data-src="share-code">${ic('copy',15)} Copiar</button></div>
-    <p class="cap">La otra persona entra en Summit, toca el icono ${ic('join',14)} junto a <b>Proyectos</b> y escribe este código.</p>`:`<div class="row"><button class="btn primary" data-act="shareGen" data-id="${p.id}">Generar código para compartir</button></div>`}
+    <p class="cap">Se une con el icono ${ic('join',14)} junto a <b>Proyectos</b>.</p>`:`<div class="row"><button class="btn primary" data-act="shareGen" data-id="${p.id}">Generar código para compartir</button></div>`}
     <div class="flabel" style="margin-top:14px">Personas (${ms.length})</div>${list}
     <div class="row">${p.shareCode?`<button class="btn sm" data-act="shareGen" data-id="${p.id}" data-new="1">Generar código nuevo</button><button class="btn sm ghost" data-act="shareStop" data-id="${p.id}">Dejar de aceptar personas</button>`:''}<span style="flex:1"></span><button class="btn" data-act="close">Cerrar</button></div>`);
   }else{
@@ -1067,7 +1254,7 @@ function openShareModal(pid){
   }
 }
 function openJoinModal(){
-  modal(`<h2>Unirse a un proyecto</h2><p class="cap">Escribe el código que te ha pasado la otra persona. Tendrá este aspecto: SUM-7K4Q-92XD-M3PA.</p>
+  modal(`<h2>Unirse a un proyecto</h2><p class="cap">Escribe el código que te han pasado.</p>
   <input class="inp mono" id="join-code" placeholder="SUM-XXXX-XXXX-XXXX" autocomplete="off" autocapitalize="characters" style="font-size:17px;padding:10px">
   <p class="auth-msg err" id="join-msg"></p>
   <div class="row end"><button class="btn ghost" data-act="close">Cancelar</button><button class="btn primary" data-act="joinGo">Unirme</button></div>`);
@@ -1108,7 +1295,7 @@ document.addEventListener('keydown',e=>{
 A.askPerm=async()=>{try{if(!('Notification' in window))throw 0;let p=Notification.permission;if(p==='default')p=await Notification.requestPermission();if(p!=='granted')throw 0;S.settings.sysNotif=true;save();notify('Summit','Notificaciones activadas')}catch(e){toast('Este navegador no permite notificaciones. En iPhone, instala Summit en la pantalla de inicio y usa el resumen diario del atajo.',{icon:'bell',ms:7000})}renderView()};
 
 /* ================== Arranque ================== */
-const APP_VERSION='1.1.1';
+const APP_VERSION='1.2.0';
 function afterStart(){
   const q=new URLSearchParams(location.search);
   const add=q.get('add'),view=q.get('view');
@@ -1140,11 +1327,36 @@ if('serviceWorker' in navigator)window.addEventListener('load',()=>navigator.ser
 (async function boot(){
   if(!window.supabase){showLibError();return}
   if(!CFG.SUPABASE_URL||/TU-PROYECTO/i.test(CFG.SUPABASE_URL)||!CFG.SUPABASE_ANON_KEY||/TU-CLAVE/i.test(CFG.SUPABASE_ANON_KEY)){showConfigError();return}
-  sb=window.supabase.createClient(CFG.SUPABASE_URL.replace(/\/+$/,'').replace(/\/rest\/v1$/,''),CFG.SUPABASE_ANON_KEY,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true},db:{schema:'summit',retry:false}});
   const recovering=/type=recovery/.test(location.hash);
+  const hp=new URLSearchParams(location.hash.slice(1)||location.search.slice(1));const linkErr=hp.get('error_code')||hp.get('error');
+  if(linkErr)history.replaceState(null,'',location.pathname);
+  sb=window.supabase.createClient(CFG.SUPABASE_URL.replace(/\/+$/,'').replace(/\/rest\/v1$/,''),CFG.SUPABASE_ANON_KEY,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true},db:{schema:'summit',retry:false}});
   sb.auth.onAuthStateChange(ev=>{if(ev==='PASSWORD_RECOVERY')setTimeout(()=>showAuth('newpass'),0)});
-  let session=null;try{session=(await sb.auth.getSession()).data.session}catch(e){}
-  if(recovering){showAuth('newpass');return}
-  if(session)await start(session.user);else showAuth('login');
+  // Arranque instantáneo: si este dispositivo ya tiene tus datos, se abre con ellos sin esperar a la red
+  const lu0=lastUser();
+  if(lu0&&hasCacheFor(lu0.id)&&!recovering&&!linkErr){
+    await start(lu0,true);
+    sb.auth.getSession().then(r=>{
+      const ses=r.data&&r.data.session;
+      if(ses&&ses.user.id===lu0.id){rememberUser(ses.user);syncAll(true);return}
+      if(ses){location.reload();return}
+      const er=r.error;
+      if(er&&(isNetErr(er)||er.name==='AuthRetryableFetchError'||!er.status||er.status>=500)){SYNC_FAIL=true;setSync('offline');return}
+      if(navigator.onLine===false){SYNC_FAIL=true;setSync('offline');return}
+      sessionExpired();
+    }).catch(()=>{SYNC_FAIL=true;setSync('offline')});
+    return;
+  }
+  let session=null,sessErr=null;try{const r=await withTimeout(sb.auth.getSession(),8000);session=r.data.session;sessErr=r.error}catch(e){sessErr=e}
+  if(recovering&&!linkErr){showAuth('newpass');return}
+  if(linkErr&&!session){showAuth('reset',{text:/expired/.test(linkErr)?'El enlace del correo ha caducado o ya se usó. Pide un código nuevo aquí.':'El enlace del correo no es válido. Pide un código nuevo aquí.',err:true});return}
+  if(session){await start(session.user);return}
+  const lu=lastUser();
+  if(lu&&hasCacheFor(lu.id)){
+    const offline=navigator.onLine===false||(sessErr&&(isNetErr(sessErr)||sessErr.name==='AuthRetryableFetchError'||/timeout/i.test(sessErr.message||'')));
+    if(offline){await start(lu,true);return}
+    if(!sessErr){await start(lu,true);sessionExpired();return}
+  }
+  showAuth('login');
 })();
 setInterval(()=>{if(!S)return;refreshToday();const now=new Date(),hm=pad(now.getHours())+':'+pad(now.getMinutes());myT().forEach(t=>{if(isOpen(t)&&t.due===TODAY&&t.time===hm&&t._n!==TODAY){t._n=TODAY;notify('Recordatorio',t.title+' · ahora',{icon:'bell'})}})},30000);

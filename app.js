@@ -925,7 +925,9 @@ function openPicker(cfg){
   const r=cfg.anchor?cfg.anchor.getBoundingClientRect():null;
   if(r&&window.innerWidth>700){const top=Math.min(r.bottom+6,window.innerHeight-el.offsetHeight-10);el.style.left=Math.max(10,Math.min(r.left,window.innerWidth-el.offsetWidth-10))+'px';el.style.top=Math.max(10,top)+'px'}
   else el.classList.add('sheet');
-  setTimeout(()=>{const i=el.querySelector('.pk-in');if(i)i.focus()},20);
+  // Con teclado físico, foco inmediato para que lo que se escriba vaya al buscador; en el móvil, sin abrir el teclado
+  const fi=()=>{const i=el.querySelector('.pk-in');if(i)i.focus({preventScroll:true})};
+  if(window.matchMedia&&matchMedia('(hover:hover)').matches)fi();setTimeout(fi,20);
 }
 function pickerItems(){const q=norm(PK.q.trim());let it=PK.items();if(q)it=it.filter(x=>norm(x.label).includes(q));if(PK.create&&q&&!it.some(x=>norm(x.label)===q))it.push({v:'__new',label:'Crear «'+PK.q.trim()+'»',icon:'plus'});return it}
 function drawPicker(){
@@ -1026,7 +1028,11 @@ function openQuick(pre,extra){
     if(e.key==='Escape'&&!ac.hidden){e.preventDefault();e.stopPropagation();ac.hidden=true;return}
     if(e.key==='Enter'){e.preventDefault();qaSave(e.shiftKey)}
   });
-  qaRefresh();setTimeout(()=>{inp.focus();inp.setSelectionRange(inp.value.length,inp.value.length)},30);
+  qaRefresh();
+  /* Enfoque inmediato, dentro del mismo toque: así el teclado del iPhone se abre solo.
+     El segundo intento cubre navegadores que ignoran el primero. */
+  const focusIn=()=>{try{inp.focus({preventScroll:true});inp.setSelectionRange(inp.value.length,inp.value.length)}catch(_){}};
+  focusIn();setTimeout(()=>{if(document.activeElement!==inp)focusIn()},60);
 }
 /* Sugerencias al escribir #, @ o ! */
 function qaAutocomplete(){
@@ -1081,6 +1087,54 @@ document.addEventListener('keydown',e=>{
   const map={h:()=>{set({due:TODAY});toast('Para hoy',{ms:1200})},m:()=>{set({due:addDays(TODAY,1)});toast('Para mañana',{ms:1200})},d:()=>pickField('due','task',chip('due')),l:()=>pickField('deadline','task',chip('deadline')),p:()=>pickField('project','task',chip('project')),c:()=>pickField('contexts','task',chip('contexts')),'@':()=>pickField('contexts','task',chip('contexts')),a:()=>pickField('assignee','task',chip('assignee')),e:()=>{complete(t);render()},Delete:()=>A.askDel(),Backspace:()=>A.askDel()};
   if(map[k]){e.preventDefault();map[k]()}
 });
+
+/* ================== Gestos táctiles ================== */
+/* 1) Deslizar desde el borde izquierdo abre el menú (y deslizar a la izquierda lo cierra).
+   2) Con una tarea abierta, deslizar hacia abajo la cierra y vuelve a la pantalla anterior. */
+(function gestures(){
+  let g=null;
+  const narrow=()=>window.matchMedia('(max-width:860px)').matches;
+  const side=()=>$('#sidebar'),det=()=>$('#detail');
+  const modalOpen=()=>!$('#modal').hidden||document.querySelector('.picker');
+  const reset=el=>{if(!el)return;el.style.transition='';el.style.transform=''};
+  document.addEventListener('touchstart',e=>{
+    g=null;if(!S||e.touches.length!==1||modalOpen())return;
+    const t=e.touches[0],drawerOpen=document.body.classList.contains('drawer');
+    const inDetail=!!(e.target.closest&&e.target.closest('#detail'))&&!det().hidden;
+    if(narrow()&&!drawerOpen&&t.clientX<=26&&!inDetail)g={type:'menu',x:t.clientX,y:t.clientY,t:Date.now(),on:false};
+    else if(narrow()&&drawerOpen)g={type:'menuclose',x:t.clientX,y:t.clientY,t:Date.now(),on:false};
+    else if(inDetail&&det().scrollTop<=0)g={type:'detail',x:t.clientX,y:t.clientY,t:Date.now(),on:false};
+  },{passive:true});
+  document.addEventListener('touchmove',e=>{
+    if(!g)return;const t=e.touches[0],dx=t.clientX-g.x,dy=t.clientY-g.y;
+    if(!g.on){
+      const h=g.type==='detail'?(dy>8&&Math.abs(dy)>Math.abs(dx)*1.4):(Math.abs(dx)>8&&Math.abs(dx)>Math.abs(dy)*1.4&&(g.type==='menu'?dx>0:dx<0));
+      if(!h){if(Math.abs(dx)>14||Math.abs(dy)>14)g=null;return}
+      g.on=true;
+    }
+    e.preventDefault();
+    if(g.type==='detail'){const d=det();d.style.transition='none';d.style.transform=`translateY(${Math.max(0,dy)}px)`}
+    else{const s=side(),w=s.offsetWidth||280;s.style.transition='none';
+      const x=g.type==='menu'?Math.min(0,-w+dx):Math.min(0,dx);s.style.transform=`translateX(${x}px)`;s.style.boxShadow='var(--shadow)'}
+  },{passive:false});
+  const end=e=>{
+    if(!g||!g.on){g=null;return}
+    const c=(e.changedTouches&&e.changedTouches[0])||{clientX:g.x,clientY:g.y},dx=c.clientX-g.x,dy=c.clientY-g.y,fast=(Date.now()-g.t)<280;
+    const type=g.type;g=null;
+    if(type==='detail'){
+      const d=det();
+      if(dy>110||(fast&&dy>50)){d.style.transition='transform .18s ease';d.style.transform='translateY(100%)';setTimeout(()=>{reset(d);A.closeDetail()},170)}
+      else{d.style.transition='transform .18s ease';d.style.transform='';setTimeout(()=>reset(d),200)}
+      return;
+    }
+    const s=side();s.style.transition='';s.style.transform='';s.style.boxShadow='';
+    const w=s.offsetWidth||280;
+    if(type==='menu'){if(dx>w*.3||(fast&&dx>40))document.body.classList.add('drawer')}
+    else if(-dx>w*.25||(fast&&-dx>40))document.body.classList.remove('drawer');
+  };
+  document.addEventListener('touchend',end,{passive:true});
+  document.addEventListener('touchcancel',()=>{if(g&&g.on){reset(det());const s=side();s.style.transition='';s.style.transform='';s.style.boxShadow=''}g=null},{passive:true});
+})();
 
 /* Paleta de comandos */
 function openPalette(){
@@ -1182,7 +1236,7 @@ document.addEventListener('keydown',e=>{
   const typing=/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
   if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'&&S){e.preventDefault();openPalette();return}
   if(e.key==='Escape'){if(!$('#modal').hidden)closeModal();else if(U.notif){U.notif=false;$('#notif').hidden=true}else if(U.sel){U.sel=null;render()}return}
-  if(typing||!$('#modal').hidden||!S)return;
+  if(typing||!$('#modal').hidden||!S||PK)return;
   if(e.key==='q'||e.key==='n'){e.preventDefault();openQuick('')}
   if(e.key==='/'){e.preventDefault();openPalette()}
 });
@@ -1260,7 +1314,7 @@ function openJoinModal(){
   <div class="row end"><button class="btn ghost" data-act="close">Cancelar</button><button class="btn primary" data-act="joinGo">Unirme</button></div>`);
   setTimeout(()=>$('#join-code').focus(),30);
 }
-async function rpc(name,args){const{data,error}=await sb.rpc(name,args||{});if(error)throw new Error(traducir(error.message));return data}
+async function rpc(name,args){if(!sb)throw new Error('Sin conexión. Inténtalo cuando vuelva la red.');const{data,error}=await sb.rpc(name,args||{});if(error)throw new Error(traducir(error.message));return data}
 A.shareProject=el=>openShareModal(el.dataset.id);
 A.joinProject=()=>openJoinModal();
 A.shareGen=async el=>{try{await flush();const c=await rpc('compartir_proyecto',{p_project:el.dataset.id,p_nuevo:!!el.dataset.new});const p=proj(el.dataset.id);p.shareCode=c;persistLocal();openShareModal(p.id);render()}catch(e){toast(esc(e.message),{icon:'close',warn:true})}};
@@ -1295,7 +1349,7 @@ document.addEventListener('keydown',e=>{
 A.askPerm=async()=>{try{if(!('Notification' in window))throw 0;let p=Notification.permission;if(p==='default')p=await Notification.requestPermission();if(p!=='granted')throw 0;S.settings.sysNotif=true;save();notify('Summit','Notificaciones activadas')}catch(e){toast('Este navegador no permite notificaciones. En iPhone, instala Summit en la pantalla de inicio y usa el resumen diario del atajo.',{icon:'bell',ms:7000})}renderView()};
 
 /* ================== Arranque ================== */
-const APP_VERSION='1.2.0';
+const APP_VERSION='1.2.2';
 function afterStart(){
   const q=new URLSearchParams(location.search);
   const add=q.get('add'),view=q.get('view');
@@ -1308,7 +1362,25 @@ function afterStart(){
 }
 function showLibError(){
   const a=$('#auth');a.hidden=false;$('#app').hidden=true;
-  a.innerHTML=`<div class="auth-card">${LOGO.replace('<svg','<svg class="auth-logo"')}<h1>Summit</h1><p>No se ha podido cargar el archivo <b>supabase.min.js</b>. Comprueba que está subido en la raíz del repositorio de GitHub, junto a index.html, y vuelve a abrir Summit.</p><button class="btn primary auth-go" onclick="location.reload()">Reintentar</button></div>`;
+  a.innerHTML=`<div class="auth-card">${LOGO.replace('<svg','<svg class="auth-logo"')}<h1>Summit</h1><p>No se ha podido cargar Summit. Comprueba la conexión a internet y pulsa Reintentar.</p><button class="btn primary auth-go" onclick="location.reload()">Reintentar</button><p class="cap" style="margin-top:10px;opacity:.6">Versión ${APP_VERSION} · falta supabase.min.js</p></div>`;
+}
+/* Si la librería de Supabase no cargó pero el dispositivo ya tiene tus datos, Summit abre igualmente
+   sin conexión y vuelve a intentar cargarla cada 20 s o al volver la red; entonces sincroniza. */
+const LIB_URLS=['supabase.min.js','https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2/dist/umd/supabase.min.js','https://unpkg.com/@supabase/supabase-js@2.117.2/dist/umd/supabase.min.js'];
+let libTrying=false;
+function retryLib(){
+  if(window.supabase||libTrying)return;libTrying=true;let i=0;
+  const next=()=>{if(window.supabase||i>=LIB_URLS.length){libTrying=false;if(window.supabase)libReady();return}
+    const s=document.createElement('script');s.src=LIB_URLS[i++]+(i===1?'?r='+Date.now():'');s.onload=next;s.onerror=next;document.head.appendChild(s)};
+  next();
+}
+function libReady(){
+  if(sb||!window.supabase)return;makeClient();
+  sb.auth.getSession().then(r=>{const ses=r.data&&r.data.session;if(ses&&ses.user.id===ME){syncAll(true)}else if(!ses&&!(r.error&&isNetErr(r.error)))sessionExpired()}).catch(()=>{});
+}
+function makeClient(){
+  sb=window.supabase.createClient(CFG.SUPABASE_URL.replace(/\/+$/,'').replace(/\/rest\/v1$/,''),CFG.SUPABASE_ANON_KEY,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true},db:{schema:'summit',retry:false}});
+  sb.auth.onAuthStateChange(ev=>{if(ev==='PASSWORD_RECOVERY')setTimeout(()=>showAuth('newpass'),0)});
 }
 function showConfigError(){
   const a=$('#auth');a.hidden=false;$('#app').hidden=true;
@@ -1325,13 +1397,16 @@ applyTheme();
 })();
 if('serviceWorker' in navigator)window.addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{}));
 (async function boot(){
-  if(!window.supabase){showLibError();return}
-  if(!CFG.SUPABASE_URL||/TU-PROYECTO/i.test(CFG.SUPABASE_URL)||!CFG.SUPABASE_ANON_KEY||/TU-CLAVE/i.test(CFG.SUPABASE_ANON_KEY)){showConfigError();return}
+  if(typeof CFG==='undefined'||!CFG||!CFG.SUPABASE_URL||/TU-PROYECTO/i.test(CFG.SUPABASE_URL)||!CFG.SUPABASE_ANON_KEY||/TU-CLAVE/i.test(CFG.SUPABASE_ANON_KEY)){showConfigError();return}
+  if(!window.supabase){
+    const lu=lastUser();
+    if(lu&&hasCacheFor(lu.id)){await start(lu,true);setSync('offline');window.addEventListener('online',retryLib);setInterval(retryLib,20000);retryLib();return}
+    showLibError();return;
+  }
   const recovering=/type=recovery/.test(location.hash);
   const hp=new URLSearchParams(location.hash.slice(1)||location.search.slice(1));const linkErr=hp.get('error_code')||hp.get('error');
   if(linkErr)history.replaceState(null,'',location.pathname);
-  sb=window.supabase.createClient(CFG.SUPABASE_URL.replace(/\/+$/,'').replace(/\/rest\/v1$/,''),CFG.SUPABASE_ANON_KEY,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true},db:{schema:'summit',retry:false}});
-  sb.auth.onAuthStateChange(ev=>{if(ev==='PASSWORD_RECOVERY')setTimeout(()=>showAuth('newpass'),0)});
+  makeClient();
   // Arranque instantáneo: si este dispositivo ya tiene tus datos, se abre con ellos sin esperar a la red
   const lu0=lastUser();
   if(lu0&&hasCacheFor(lu0.id)&&!recovering&&!linkErr){

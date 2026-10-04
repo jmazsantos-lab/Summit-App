@@ -1,8 +1,8 @@
 // Summit · service worker: la app abre y funciona sin conexión.
 // Los datos se guardan en el dispositivo y se sincronizan con Supabase al volver la red.
-const VERSION = 'summit-1.2.0';
+const VERSION = 'summit-1.2.2';
 const SHELL = [
-  './', 'index.html', 'styles.css?v=1.2.0', 'app.js?v=1.2.0', 'config.js?v=1.2.0', 'supabase.min.js', 'manifest.webmanifest',
+  './', 'index.html', 'styles.css?v=1.2.2', 'app.js?v=1.2.2', 'config.js?v=1.2.2', 'supabase.min.js', 'manifest.webmanifest',
   'icon-192.png', 'icon-512.png', 'apple-touch-icon.png', 'favicon-32.png', 'logo.svg',
   'figtree-latin-400-normal.woff2', 'figtree-latin-500-normal.woff2', 'figtree-latin-600-normal.woff2', 'figtree-latin-700-normal.woff2',
   'bricolage-grotesque-latin-600-normal.woff2', 'bricolage-grotesque-latin-700-normal.woff2',
@@ -39,8 +39,10 @@ self.addEventListener('fetch', e => {
     e.respondWith((async () => {
       try {
         const r = await Promise.race([fetch(req), timeout(3000)]);
-        if (r && r.ok) { const cp = r.clone(); caches.open(VERSION).then(c => c.put('index.html', cp)); }
-        return r;
+        if (r && r.ok) { const cp = r.clone(); caches.open(VERSION).then(c => c.put('index.html', cp)); return r; }
+        // GitHub Pages respondió con error (404 durante una publicación, por ejemplo): usar la copia guardada si existe
+        const c = await caches.open(VERSION);
+        return (await c.match('index.html')) || (await caches.match('index.html', { ignoreSearch: true })) || r;
       } catch (_) {
         const c = await caches.open(VERSION);
         return (await c.match('index.html')) || (await c.match('./')) || new Response('Summit no está disponible sin conexión todavía. Ábrela una vez con internet.', { status: 503, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
@@ -55,10 +57,11 @@ self.addEventListener('fetch', e => {
     if (hit) return hit;
     try {
       const r = await fetch(req);
-      if (r.ok) { const cp = r.clone(); caches.open(VERSION).then(c => c.put(req, cp)); }
-      return r;
+      if (r.ok) { const cp = r.clone(); caches.open(VERSION).then(c => c.put(req, cp)); return r; }
+      // Si la red da error, probar cualquier copia guardada de una versión anterior
+      return (await caches.match(req, { ignoreSearch: true })) || r;
     } catch (_) {
-      return new Response('', { status: 504 });
+      return (await caches.match(req, { ignoreSearch: true })) || new Response('', { status: 504 });
     }
   })());
 });

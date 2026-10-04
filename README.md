@@ -4,7 +4,7 @@ Gestor de tareas y proyectos basado en el método GTD (Getting Things Done). Apl
 
 - **Frontend:** HTML, CSS y JavaScript sin dependencias de compilación. Se publica tal cual en GitHub Pages.
 - **Backend:** Supabase (Postgres, autenticación por correo y contraseña, seguridad por fila).
-- **Versión:** 1.1.1
+- **Versión:** 1.2.2
 
 ## Estructura
 
